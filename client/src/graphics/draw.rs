@@ -397,7 +397,7 @@ impl Draw {
 
             let nearby_nodes_started = Instant::now();
             let nearby_nodes = if let Some(sim) = sim.as_deref() {
-                traversal::nearby_nodes(&sim.graph, &view, self.cfg.local_simulation.view_distance)
+                traversal::nearby_nodes(&sim.graph, &view, sim.cfg.view_distance)
             } else {
                 vec![]
             };
@@ -535,10 +535,15 @@ impl Draw {
             device.end_command_buffer(state.post_cmd).unwrap();
 
             // Specify the uniform data before actually submitting the command to transfer it
+            let fog_distance = sim
+                .as_ref()
+                .map_or(self.cfg.local_simulation.fog_distance, |sim| {
+                    sim.cfg.fog_distance
+                });
             state.uniforms.write(Uniforms {
                 view_projection,
                 inverse_projection: *projection.inverse().matrix(),
-                fog_density: fog::density(self.cfg.local_simulation.fog_distance, 1e-3, 5.0),
+                fog_density: fog::density(fog_distance, 1e-3, 5.0),
                 time: self.epoch.elapsed().as_secs_f32().fract(),
             });
 
