@@ -85,7 +85,8 @@ impl Config {
                 .map(PathBuf::from)
                 .or(save)
                 .unwrap_or("default.save".into()),
-            chunk_load_parallelism: chunk_load_parallelism.unwrap_or(256),
+            // Large values produce severe frame spikes when a hyperbolic fringe finishes at once.
+            chunk_load_parallelism: chunk_load_parallelism.unwrap_or(32),
             server,
             local_simulation: SimConfig::from_raw(&local_simulation),
         }

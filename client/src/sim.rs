@@ -40,6 +40,7 @@ const MATERIAL_PALETTE: [Material; 10] = [
 pub struct DebugCoordinates {
     pub node_hash: u128,
     pub node_depth: u32,
+    pub loaded_node_count: u32,
     pub klein: [f32; 3],
     pub lorentz: [f32; 4],
     pub local_hyperbolic_radius: f32,
@@ -328,6 +329,7 @@ impl Sim {
         Some(DebugCoordinates {
             node_hash: self.graph.hash_of(position.node),
             node_depth: self.graph.depth(position.node),
+            loaded_node_count: self.graph.len(),
             klein: [point.x / point.w, point.y / point.w, point.z / point.w],
             lorentz: [point.x, point.y, point.z, point.w],
             local_hyperbolic_radius: point.w.max(1.0).acosh(),
@@ -356,7 +358,7 @@ impl Sim {
         self.worldgen_driver.drive(
             self.view(),
             self.cfg.chunk_generation_distance,
-            5.0 * self.cfg.meters_to_absolute,
+            self.cfg.meters_to_absolute,
             &mut self.graph,
         );
 
@@ -660,6 +662,10 @@ impl Sim {
             &(up.as_ref() * (self.cfg.character.character_radius - 1e-3)),
         );
         pos
+    }
+
+    pub fn nearby_nodes(&self) -> std::sync::Arc<Vec<(NodeId, MIsometry<f32>)>> {
+        self.worldgen_driver.nearby_nodes()
     }
 
     /// Destroy all aspects of an entity

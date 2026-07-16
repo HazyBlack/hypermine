@@ -28,6 +28,12 @@ distance change invalidates the result. Render preparation applies an exact dist
 conservative cached set, while world generation stops scanning once all eligible chunks have been
 scheduled.
 
+Cache padding must never expand the generated graph beyond the configured generation radius. The
+renderer reuses the generation traversal because it cannot draw terrain that has not been generated.
+Generation refreshes after roughly one metre of movement, while completed chunks and new surface
+meshes are each admitted at a maximum of 32 per frame. These budgets trade a little streaming latency
+for much lower frame-time spikes.
+
 Baseline at 2560x1440 and 85 m on the development machine:
 
 - Nearby traversal median before caching: 8.39 ms per frame.

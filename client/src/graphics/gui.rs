@@ -1,3 +1,5 @@
+use std::time::Instant;
+
 use yakui::{
     Alignment, Color, Constraints, CrossAxisAlignment, MainAxisSize, align, colored_box,
     colored_box_container, constrained, image, label, offset, pad, row, slider, stack, text,
@@ -51,6 +53,8 @@ pub struct GuiState {
     held_stack: Option<ItemStack>,
     cursor_position: [f32; 2],
     hovered_material: Option<Material>,
+    last_frame_at: Instant,
+    smoothed_frame_seconds: f32,
 }
 
 impl GuiState {
@@ -70,6 +74,8 @@ impl GuiState {
             held_stack: None,
             cursor_position: [0.0, 0.0],
             hovered_material: None,
+            last_frame_at: Instant::now(),
+            smoothed_frame_seconds: 1.0 / 60.0,
         }
     }
 
@@ -233,6 +239,14 @@ impl GuiState {
         worlds: &mut WorldManager,
         surface_size: [f32; 2],
     ) -> GuiAction {
+        let now = Instant::now();
+        let frame_seconds = (now - self.last_frame_at).as_secs_f32();
+        self.last_frame_at = now;
+        if frame_seconds.is_finite() && frame_seconds > 0.0 && frame_seconds < 1.0 {
+            let smoothing = 1.0 - (-frame_seconds * 5.0).exp();
+            self.smoothed_frame_seconds +=
+                (frame_seconds - self.smoothed_frame_seconds) * smoothing;
+        }
         let mut action = GuiAction::default();
         let world_id = worlds.selected_id().to_owned();
         self.reconcile_and_sync(sim.as_deref_mut(), settings, &world_id);
@@ -357,6 +371,11 @@ impl GuiState {
                 list.main_axis_size = MainAxisSize::Min;
                 list.show(|| {
                     text(19.0, "Hypermine Developer (H^3)");
+                    label(format!(
+                        "FPS: {:.0}   Frame: {:.2} ms",
+                        1.0 / self.smoothed_frame_seconds.max(1.0e-6),
+                        self.smoothed_frame_seconds * 1_000.0
+                    ));
                     if let Some(coordinates) = coordinates {
                         let high = coordinates.node_hash >> 64;
                         let low = coordinates.node_hash as u64;
@@ -365,6 +384,7 @@ impl GuiState {
                             "Cell depth from spawn: {} dodecahedra",
                             coordinates.node_depth
                         ));
+                        label(format!("Loaded cells: {}", coordinates.loaded_node_count));
                         label(format!(
                             "Klein local:  x {:+.5}   y {:+.5}   z {:+.5}",
                             coordinates.klein[0], coordinates.klein[1], coordinates.klein[2]

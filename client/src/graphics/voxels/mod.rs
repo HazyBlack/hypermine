@@ -26,13 +26,13 @@ use surface::Surface;
 use surface_extraction::{DrawBuffer, ExtractTask, ScratchBuffer, SurfaceExtraction};
 
 pub struct Voxels {
-    config: Arc<Config>,
     surface_extraction: SurfaceExtraction,
     extraction_scratch: ScratchBuffer,
     surfaces: DrawBuffer,
     states: LruSlab<SurfaceState>,
     draw: Surface,
     max_chunks: u32,
+    max_extractions_per_frame: usize,
 }
 
 impl Voxels {
@@ -57,20 +57,21 @@ impl Voxels {
         let surfaces = DrawBuffer::new(gfx, max_chunks, dimension);
         let draw = Surface::new(gfx, loader, &surfaces);
         let surface_extraction = SurfaceExtraction::new(gfx);
+        let max_extractions_per_frame = config.chunk_load_parallelism.min(32) as usize;
         let extraction_scratch = surface_extraction::ScratchBuffer::new(
             gfx,
             &surface_extraction,
-            config.chunk_load_parallelism * frames,
+            max_extractions_per_frame as u32 * frames,
             dimension,
         );
         Self {
-            config,
             surface_extraction,
             extraction_scratch,
             surfaces,
             states: LruSlab::with_capacity(max_chunks),
             draw,
             max_chunks,
+            max_extractions_per_frame,
         }
     }
 
@@ -144,7 +145,7 @@ impl Voxels {
                 }
                 if let (None, &VoxelData::Dense(ref data)) = (&surface, voxels) {
                     // Extract a surface so it can be drawn in future frames
-                    if frame.extracted.len() == self.config.chunk_load_parallelism as usize {
+                    if frame.extracted.len() == self.max_extractions_per_frame {
                         continue;
                     }
                     let removed = if self.states.len() == self.max_chunks {

@@ -1,4 +1,4 @@
-use std::time::Instant;
+use std::{sync::Arc, time::Instant};
 
 use common::{
     dodeca::{self, Vertex},
@@ -43,7 +43,10 @@ impl WorldgenDriver {
         let drive_worldgen_started = Instant::now();
 
         // Check for chunks that have finished generating
-        while let Some(chunk) = self.work_queue.poll() {
+        for _ in 0..MAX_CHUNK_COMPLETIONS_PER_FRAME {
+            let Some(chunk) = self.work_queue.poll() else {
+                break;
+            };
             self.add_chunk_to_graph(graph, ChunkId::new(chunk.node, chunk.chunk), chunk.voxels);
         }
 
@@ -60,7 +63,9 @@ impl WorldgenDriver {
             chunk_generation_distance,
             traversal_padding,
         ) {
-            traversal::ensure_nearby(graph, &view, chunk_generation_distance + traversal_padding);
+            // Cache padding must never expand the generated graph. Hyperbolic cell counts grow
+            // exponentially, so even a small accidental radius increase can create large spikes.
+            traversal::ensure_nearby(graph, &view, chunk_generation_distance);
             self.nearby_cache
                 .refresh(graph, &view, chunk_generation_distance, traversal_padding);
             self.scan_complete = false;
@@ -106,6 +111,10 @@ impl WorldgenDriver {
         histogram!("frame.cpu.drive_worldgen").record(drive_worldgen_started.elapsed());
     }
 
+    pub fn nearby_nodes(&self) -> Arc<Vec<(NodeId, common::math::MIsometry<f32>)>> {
+        self.nearby_cache.shared_nodes()
+    }
+
     /// Adds established voxel data to the graph. This could come from world generation or sent from the server,
     /// depending on whether the chunk has been modified.
     pub fn add_chunk_to_graph(
@@ -147,6 +156,8 @@ impl WorldgenDriver {
         }
     }
 }
+
+const MAX_CHUNK_COMPLETIONS_PER_FRAME: usize = 32;
 
 struct ChunkDesc {
     node: NodeId,
