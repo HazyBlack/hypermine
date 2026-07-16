@@ -395,10 +395,10 @@ impl Draw {
             );
 
             let nearby_nodes_started = Instant::now();
-            let nearby_nodes = if let Some(sim) = sim.as_deref() {
+            let nearby = if let Some(sim) = sim.as_deref() {
                 sim.nearby_nodes()
             } else {
-                Arc::default()
+                common::traversal::NearbySnapshot::default()
             };
             histogram!("frame.cpu.nearby_nodes").record(nearby_nodes_started.elapsed());
 
@@ -407,7 +407,7 @@ impl Draw {
                     device,
                     state.voxels.as_mut().unwrap(),
                     sim,
-                    &nearby_nodes,
+                    &nearby,
                     state.post_cmd,
                     frustum,
                 );
@@ -482,7 +482,7 @@ impl Draw {
             }
 
             if let Some(sim) = sim.as_deref() {
-                for &(node, ref transform) in nearby_nodes.iter() {
+                for &(node, ref transform) in nearby.nodes.iter() {
                     for &entity in sim.graph_entities.get(node) {
                         if sim.local_character == Some(entity) {
                             // Don't draw ourself
@@ -495,9 +495,10 @@ impl Draw {
                         if let Some(character_model) = self.loader.get(self.character_model)
                             && let Ok(ch) = sim.world.get::<&Character>(entity)
                         {
-                            let transform = na::Matrix4::from(*transform * pos.local)
-                                * na::Matrix4::new_scaling(sim.cfg().meters_to_absolute)
-                                * ch.state.orientation.to_homogeneous();
+                            let transform =
+                                na::Matrix4::from(nearby.basis * *transform * pos.local)
+                                    * na::Matrix4::new_scaling(sim.cfg().meters_to_absolute)
+                                    * ch.state.orientation.to_homogeneous();
                             for mesh in &character_model.0 {
                                 self.meshes
                                     .draw(device, state.common_ds, cmd, mesh, &transform);

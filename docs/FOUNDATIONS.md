@@ -34,6 +34,10 @@ Generation refreshes after roughly one metre of movement, while completed chunks
 meshes are each admitted at a maximum of 32 per frame. These budgets trade a little streaming latency
 for much lower frame-time spikes.
 
+Cell transitions rebase the cached traversal through a single shared basis transform. Never expose
+cached node transforms relative to the previous reference cell, and never rebuild the full traversal
+solely because the player's canonical cell changed.
+
 Baseline at 2560x1440 and 85 m on the development machine:
 
 - Nearby traversal median before caching: 8.39 ms per frame.

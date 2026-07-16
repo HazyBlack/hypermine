@@ -18,8 +18,9 @@ use crate::{
 use common::{
     dodeca::{self, Vertex},
     graph::NodeId,
-    math::{MIsometry, MPoint},
+    math::MPoint,
     node::{Chunk, ChunkId, VoxelData},
+    traversal::NearbySnapshot,
 };
 
 use surface::Surface;
@@ -84,7 +85,7 @@ impl Voxels {
         device: &Device,
         frame: &mut Frame,
         sim: &mut Sim,
-        nearby_nodes: &[(NodeId, MIsometry<f32>)],
+        nearby: &NearbySnapshot,
         cmd: vk::CommandBuffer,
         frustum: &Frustum,
     ) {
@@ -105,11 +106,11 @@ impl Voxels {
         }
         let node_scan_started = Instant::now();
         let frustum_planes = frustum.planes();
-        let local_to_view = view.local.inverse();
+        let local_to_view = view.local.inverse() * nearby.basis;
         let max_node_cosh_distance =
             (sim.cfg.view_distance + dodeca::BOUNDING_SPHERE_RADIUS).cosh();
         let mut extractions = Vec::new();
-        for &(node, ref node_transform) in nearby_nodes {
+        for &(node, ref node_transform) in nearby.nodes.iter() {
             let node_to_view = local_to_view * node_transform;
             let origin = node_to_view * MPoint::origin();
             if origin.w > max_node_cosh_distance {
@@ -141,7 +142,7 @@ impl Voxels {
                     frame.drawn.push(slot);
                     // Transfer transform
                     frame.surface.transforms_mut()[slot as usize] =
-                        na::Matrix4::from(*node_transform) * vertex.chunk_to_node();
+                        na::Matrix4::from(nearby.basis * *node_transform) * vertex.chunk_to_node();
                 }
                 if let (None, &VoxelData::Dense(ref data)) = (&surface, voxels) {
                     // Extract a surface so it can be drawn in future frames

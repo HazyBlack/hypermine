@@ -1,4 +1,4 @@
-use std::{sync::Arc, time::Instant};
+use std::time::Instant;
 
 use common::{
     dodeca::{self, Vertex},
@@ -55,7 +55,7 @@ impl WorldgenDriver {
             // there's no point trying to generate chunks.
             return;
         }
-        let local_to_view = view.local.inverse();
+        self.nearby_cache.rebase_to(view.node);
 
         if self.nearby_cache.needs_refresh(
             graph,
@@ -75,6 +75,8 @@ impl WorldgenDriver {
             return;
         }
         let nearby_nodes = self.nearby_cache.shared_nodes();
+        let basis = self.nearby_cache.basis();
+        let local_to_view = view.local.inverse() * basis;
 
         let mut completed_scan = true;
         'nearby_nodes: for &(node, ref node_transform) in nearby_nodes.iter() {
@@ -111,8 +113,8 @@ impl WorldgenDriver {
         histogram!("frame.cpu.drive_worldgen").record(drive_worldgen_started.elapsed());
     }
 
-    pub fn nearby_nodes(&self) -> Arc<Vec<(NodeId, common::math::MIsometry<f32>)>> {
-        self.nearby_cache.shared_nodes()
+    pub fn nearby_nodes(&self) -> traversal::NearbySnapshot {
+        self.nearby_cache.snapshot()
     }
 
     /// Adds established voxel data to the graph. This could come from world generation or sent from the server,

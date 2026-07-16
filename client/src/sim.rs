@@ -355,12 +355,6 @@ impl Sim {
 
     pub fn step(&mut self, dt: Duration, net: &mut server::Handle) {
         self.local_character_controller.renormalize_orientation();
-        self.worldgen_driver.drive(
-            self.view(),
-            self.cfg.chunk_generation_distance,
-            self.cfg.meters_to_absolute,
-            &mut self.graph,
-        );
 
         let step_interval = self.cfg.step_interval;
         self.since_input_sent += dt;
@@ -409,6 +403,12 @@ impl Sim {
         if !self.no_clip {
             self.local_character_controller.align_to_gravity();
         }
+        self.worldgen_driver.drive(
+            self.view(),
+            self.cfg.chunk_generation_distance,
+            self.cfg.meters_to_absolute,
+            &mut self.graph,
+        );
     }
 
     pub fn handle_net(&mut self, msg: server::Message) {
@@ -664,7 +664,7 @@ impl Sim {
         pos
     }
 
-    pub fn nearby_nodes(&self) -> std::sync::Arc<Vec<(NodeId, MIsometry<f32>)>> {
+    pub fn nearby_nodes(&self) -> common::traversal::NearbySnapshot {
         self.worldgen_driver.nearby_nodes()
     }
 
