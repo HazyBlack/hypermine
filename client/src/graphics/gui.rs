@@ -37,7 +37,9 @@ pub struct GuiAction {
 
 pub struct GuiState {
     show_hud: bool,
+    show_navigation: bool,
     show_debug: bool,
+    guide_home: bool,
     screen: MenuScreen,
     rebinding: Option<Action>,
     new_world_name: String,
@@ -54,7 +56,9 @@ impl GuiState {
     pub fn new(icons: MaterialIcons) -> Self {
         Self {
             show_hud: true,
+            show_navigation: false,
             show_debug: false,
+            guide_home: false,
             screen: MenuScreen::Closed,
             rebinding: None,
             new_world_name: "New World".to_owned(),
@@ -185,6 +189,14 @@ impl GuiState {
         self.show_debug = !self.show_debug;
     }
 
+    pub fn toggle_navigation(&mut self) {
+        self.show_navigation = !self.show_navigation;
+    }
+
+    pub fn toggle_guide_home(&mut self) {
+        self.guide_home = !self.guide_home;
+    }
+
     pub fn handle_escape(&mut self) {
         self.rebinding = None;
         self.status = None;
@@ -229,6 +241,22 @@ impl GuiState {
             .is_none_or(|sim| !sim.cfg.gameplay_enabled || layout.creative_tab);
         if self.show_hud && !self.menu_open() {
             self.hud(&layout, unlimited);
+        }
+        if !self.menu_open()
+            && let Some(sim) = sim.as_deref()
+        {
+            let guidance = sim.home_guidance();
+            if self.show_navigation {
+                self.navigation_overlay(guidance);
+            }
+            if self.guide_home {
+                self.home_marker(
+                    guidance,
+                    surface_size,
+                    settings.value.video.ui_scale,
+                    settings.value.video.fov_degrees,
+                );
+            }
         }
         if self.show_debug
             && !self.menu_open()
@@ -348,10 +376,120 @@ impl GuiState {
                                 label("Use Creative Inventory > Return to Spawn to recover.");
                             }
                             label("Position = cell address + local H^3 coordinates");
-                            label("F3 - hide developer overlay");
+                            label("F4 - hide developer overlay");
                         });
                     });
                 });
+            });
+        });
+    }
+
+    fn navigation_overlay(&self, guidance: crate::sim::HomeGuidance) {
+        align(Alignment::TOP_LEFT, || {
+            pad(Pad::all(12.0), || {
+                colored_box_container(Color::BLACK.with_alpha(0.78), || {
+                    pad(Pad::all(10.0), || {
+                        let mut list = List::column();
+                        list.item_spacing = 3.0;
+                        list.main_axis_size = MainAxisSize::Min;
+                        list.show(|| {
+                            text(19.0, "Location & Navigation");
+                            if guidance.crossings_remaining == 0 {
+                                label("You are at Spawn");
+                            } else {
+                                label(format!("Home: {} exits away", guidance.crossings_remaining));
+                                if self.guide_home {
+                                    label("Follow the HOME marker");
+                                } else {
+                                    label("Press H to show the way home");
+                                }
+                            }
+                            label("F3 - hide navigation");
+                        });
+                    });
+                });
+            });
+        });
+    }
+
+    fn home_marker(
+        &self,
+        guidance: crate::sim::HomeGuidance,
+        surface_size: [f32; 2],
+        ui_scale: f32,
+        vfov_degrees: f32,
+    ) {
+        if guidance.crossings_remaining == 0 {
+            align(Alignment::TOP_CENTER, || {
+                pad(Pad::all(18.0), || {
+                    colored_box_container(Color::rgba(35, 150, 90, 230), || {
+                        pad(Pad::balanced(16.0, 8.0), || {
+                            label("HOME — You are at Spawn");
+                        });
+                    });
+                });
+            });
+            return;
+        }
+        let Some([x, y, z]) = guidance.target_in_view else {
+            return;
+        };
+        let logical = [surface_size[0] / ui_scale, surface_size[1] / ui_scale];
+        let aspect = logical[0] / logical[1];
+        let vfov = vfov_degrees.to_radians();
+        let hfov = (aspect * vfov.tan()).atan();
+        let in_front = z < -1.0e-4;
+        let (mut dx, mut dy) = if in_front {
+            (x / (-z * hfov.tan()), -y / (-z * vfov.tan()))
+        } else {
+            (-x, y)
+        };
+        if dx.abs() < 1.0e-4 && dy.abs() < 1.0e-4 {
+            dy = if in_front { 0.0 } else { 1.0 };
+        }
+        let on_screen = in_front && dx.abs() <= 0.82 && dy.abs() <= 0.76;
+        if !on_screen {
+            let scale = (0.82 / dx.abs().max(1.0e-4)).min(0.76 / dy.abs().max(1.0e-4));
+            dx *= scale;
+            dy *= scale;
+        }
+        let center = [logical[0] * 0.5, logical[1] * 0.5];
+        let marker_size = [132.0, 58.0];
+        let position = [
+            center[0] + dx * center[0] - marker_size[0] * 0.5,
+            center[1] + dy * center[1] - marker_size[1] * 0.5,
+        ];
+        let arrow = if on_screen {
+            "◆"
+        } else if dx.abs() > dy.abs() {
+            if dx > 0.0 { "▶" } else { "◀" }
+        } else if dy > 0.0 {
+            "▼"
+        } else {
+            "▲"
+        };
+        align(Alignment::TOP_LEFT, || {
+            offset(position.into(), || {
+                constrained(
+                    Constraints {
+                        min: marker_size.into(),
+                        max: marker_size.into(),
+                    },
+                    || {
+                        colored_box_container(Color::rgba(24, 145, 214, 225), || {
+                            align(Alignment::CENTER, || {
+                                let mut list = List::column();
+                                list.item_spacing = 1.0;
+                                list.cross_axis_alignment = CrossAxisAlignment::Center;
+                                list.main_axis_size = MainAxisSize::Min;
+                                list.show(|| {
+                                    text(22.0, format!("{arrow} HOME"));
+                                    label(format!("{} exits", guidance.crossings_remaining));
+                                });
+                            });
+                        });
+                    },
+                );
             });
         });
     }

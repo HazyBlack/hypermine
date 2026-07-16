@@ -350,8 +350,14 @@ impl Window {
         if bound(Action::ToggleHud) {
             self.gui_state.toggle_hud();
         }
+        if bound(Action::PlayerNavigation) {
+            self.gui_state.toggle_navigation();
+        }
         if bound(Action::DeveloperOverlay) {
             self.gui_state.toggle_debug();
+        }
+        if bound(Action::GuideHome) {
+            self.gui_state.toggle_guide_home();
         }
         if bound(Action::OpenInventory) {
             self.open_inventory();

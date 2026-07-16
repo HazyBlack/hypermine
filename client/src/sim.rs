@@ -45,6 +45,13 @@ pub struct DebugCoordinates {
     pub local_hyperbolic_radius: f32,
 }
 
+#[derive(Debug, Clone, Copy)]
+pub struct HomeGuidance {
+    pub crossings_remaining: u32,
+    /// The center of the next exit in camera-relative Klein coordinates.
+    pub target_in_view: Option<[f32; 3]>,
+}
+
 /// Game state
 pub struct Sim {
     // World state
@@ -325,6 +332,23 @@ impl Sim {
             lorentz: [point.x, point.y, point.z, point.w],
             local_hyperbolic_radius: point.w.max(1.0).acosh(),
         })
+    }
+
+    pub fn home_guidance(&self) -> HomeGuidance {
+        let view = self.view();
+        let crossings_remaining = self.graph.depth(view.node);
+        let target_in_view = self.graph.primary_parent_side(view.node).and_then(|side| {
+            let origin = MPoint::origin();
+            let opposite = *side.reflection() * origin;
+            let face_center = origin.midpoint(&opposite);
+            let point: na::Vector4<f32> = (view.local.inverse() * face_center).into();
+            (point.iter().all(|component| component.is_finite()) && point.w.abs() >= f32::EPSILON)
+                .then_some([point.x / point.w, point.y / point.w, point.z / point.w])
+        });
+        HomeGuidance {
+            crossings_remaining,
+            target_in_view,
+        }
     }
 
     pub fn step(&mut self, dt: Duration, net: &mut server::Handle) {

@@ -18,6 +18,21 @@ pub struct UserSettings {
 impl UserSettings {
     fn sanitize(&mut self) {
         let defaults = Self::default();
+        // F3 used to open the developer overlay. Move that untouched legacy default to F4 so
+        // existing players receive the new player-facing F3 screen without a key conflict.
+        if !self
+            .controls
+            .bindings
+            .contains_key(Action::PlayerNavigation.id())
+            && self
+                .controls
+                .bindings
+                .get(Action::DeveloperOverlay.id())
+                .map(String::as_str)
+                == Some("F3")
+        {
+            self.controls.set_binding(Action::DeveloperOverlay, "F4");
+        }
         self.video.width = self.video.width.clamp(800, 3840);
         self.video.height = self.video.height.clamp(480, 2160);
         clamp_finite(
@@ -128,7 +143,9 @@ pub enum Action {
     RollRight,
     OpenInventory,
     ToggleHud,
+    PlayerNavigation,
     DeveloperOverlay,
+    GuideHome,
     PreviousMaterial,
     NextMaterial,
     PickMaterial,
@@ -144,7 +161,7 @@ pub enum Action {
 }
 
 impl Action {
-    pub const ALL: [Self; 25] = [
+    pub const ALL: [Self; 27] = [
         Self::Forward,
         Self::Backward,
         Self::Left,
@@ -157,7 +174,9 @@ impl Action {
         Self::RollRight,
         Self::OpenInventory,
         Self::ToggleHud,
+        Self::PlayerNavigation,
         Self::DeveloperOverlay,
+        Self::GuideHome,
         Self::PreviousMaterial,
         Self::NextMaterial,
         Self::PickMaterial,
@@ -186,7 +205,9 @@ impl Action {
             Self::RollRight => "roll_right",
             Self::OpenInventory => "open_inventory",
             Self::ToggleHud => "toggle_hud",
+            Self::PlayerNavigation => "player_navigation",
             Self::DeveloperOverlay => "developer_overlay",
+            Self::GuideHome => "guide_home",
             Self::PreviousMaterial => "previous_material",
             Self::NextMaterial => "next_material",
             Self::PickMaterial => "pick_material",
@@ -216,7 +237,9 @@ impl Action {
             Self::RollRight => "Roll Right",
             Self::OpenInventory => "Open Inventory",
             Self::ToggleHud => "Toggle HUD",
+            Self::PlayerNavigation => "Location & Navigation",
             Self::DeveloperOverlay => "Developer Coordinates",
+            Self::GuideHome => "Guide Home",
             Self::PreviousMaterial => "Previous Hotbar Slot",
             Self::NextMaterial => "Next Hotbar Slot",
             Self::PickMaterial => "Pick Looked-at Material",
@@ -246,7 +269,9 @@ impl Action {
             Self::RollRight => "KeyE",
             Self::OpenInventory => "KeyI",
             Self::ToggleHud => "F1",
-            Self::DeveloperOverlay => "F3",
+            Self::PlayerNavigation => "F3",
+            Self::DeveloperOverlay => "F4",
+            Self::GuideHome => "KeyH",
             Self::PreviousMaterial => "Minus",
             Self::NextMaterial => "Equal",
             Self::PickMaterial => "KeyG",
@@ -332,4 +357,27 @@ pub fn display_key(key: &str) -> String {
         .or_else(|| key.strip_prefix("Digit"))
         .unwrap_or(key)
         .replace("Arrow", "Arrow ")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn migrates_legacy_f3_developer_binding() {
+        let mut settings = UserSettings::default();
+        settings
+            .controls
+            .bindings
+            .remove(Action::PlayerNavigation.id());
+        settings
+            .controls
+            .set_binding(Action::DeveloperOverlay, "F3");
+
+        settings.sanitize();
+
+        assert_eq!(settings.controls.binding(Action::PlayerNavigation), "F3");
+        assert_eq!(settings.controls.binding(Action::DeveloperOverlay), "F4");
+        assert_eq!(settings.controls.binding(Action::GuideHome), "KeyH");
+    }
 }
