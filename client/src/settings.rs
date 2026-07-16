@@ -146,6 +146,7 @@ pub enum Action {
     PlayerNavigation,
     DeveloperOverlay,
     GuideHome,
+    GeometryPreview,
     PreviousMaterial,
     NextMaterial,
     PickMaterial,
@@ -161,7 +162,7 @@ pub enum Action {
 }
 
 impl Action {
-    pub const ALL: [Self; 27] = [
+    pub const ALL: [Self; 28] = [
         Self::Forward,
         Self::Backward,
         Self::Left,
@@ -177,6 +178,7 @@ impl Action {
         Self::PlayerNavigation,
         Self::DeveloperOverlay,
         Self::GuideHome,
+        Self::GeometryPreview,
         Self::PreviousMaterial,
         Self::NextMaterial,
         Self::PickMaterial,
@@ -208,6 +210,7 @@ impl Action {
             Self::PlayerNavigation => "player_navigation",
             Self::DeveloperOverlay => "developer_overlay",
             Self::GuideHome => "guide_home",
+            Self::GeometryPreview => "geometry_preview",
             Self::PreviousMaterial => "previous_material",
             Self::NextMaterial => "next_material",
             Self::PickMaterial => "pick_material",
@@ -240,6 +243,7 @@ impl Action {
             Self::PlayerNavigation => "Location & Navigation",
             Self::DeveloperOverlay => "Developer Coordinates",
             Self::GuideHome => "Guide Home",
+            Self::GeometryPreview => "Geometry Preview",
             Self::PreviousMaterial => "Previous Hotbar Slot",
             Self::NextMaterial => "Next Hotbar Slot",
             Self::PickMaterial => "Pick Looked-at Material",
@@ -272,6 +276,7 @@ impl Action {
             Self::PlayerNavigation => "F3",
             Self::DeveloperOverlay => "F4",
             Self::GuideHome => "KeyH",
+            Self::GeometryPreview => "KeyZ",
             Self::PreviousMaterial => "Minus",
             Self::NextMaterial => "Equal",
             Self::PickMaterial => "KeyG",

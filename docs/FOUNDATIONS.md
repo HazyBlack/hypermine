@@ -19,6 +19,18 @@ costs, drops, and undo data. A batch is rejected when it exceeds 65,536 edits. I
 should group dirty chunks, network deltas, mesh invalidation, drops, and undo history around the
 logical batch instead of treating every voxel as a separate player action.
 
+## Transient geometry previews
+
+Selection, block-damage cracks, geodesic construction guides, region boundaries, and drill
+footprints should use the lightweight transient-geometry render path rather than creating world
+blocks or persistent chunk meshes. A voxel raycast carries its normalized chunk-to-view transform
+with the hit, so previews never need to search the exponentially large nearby-cell traversal.
+
+`Selection` is the first implementation: it generates a highlighted cube directly in the vertex
+shader with one small draw call and no vertex-buffer allocation. New geometry tools should extend
+this shared path with bounded preview descriptions; preview rendering must remain visual-only, while
+committed edits continue through the authoritative `BlockEditBatch` path.
+
 ## Traversal performance
 
 Hyperbolic nearby-cell counts grow exponentially with distance. Recomputing a breadth-first graph

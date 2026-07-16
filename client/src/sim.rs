@@ -80,6 +80,7 @@ pub struct Sim {
     average_movement_input: na::Vector3<f32>,
     no_clip: bool,
     creative_mode: bool,
+    geometry_preview: bool,
     return_to_spawn_requested: bool,
     /// Whether no_clip will be toggled next step
     toggle_no_clip: bool,
@@ -124,6 +125,7 @@ impl Sim {
             average_movement_input: na::zero(),
             no_clip: true,
             creative_mode: true,
+            geometry_preview: false,
             return_to_spawn_requested: false,
             toggle_no_clip: false,
             is_jumping: false,
@@ -229,6 +231,16 @@ impl Sim {
 
     pub fn creative_mode(&self) -> bool {
         self.creative_mode
+    }
+
+    pub fn toggle_geometry_preview(&mut self) {
+        if !self.cfg.gameplay_enabled || self.creative_mode {
+            self.geometry_preview = !self.geometry_preview;
+        }
+    }
+
+    pub fn geometry_preview_enabled(&self) -> bool {
+        self.geometry_preview && (!self.cfg.gameplay_enabled || self.creative_mode)
     }
 
     pub fn request_return_to_spawn(&mut self) {

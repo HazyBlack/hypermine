@@ -5,7 +5,7 @@ use ash::vk;
 use lahar::Staged;
 use metrics::histogram;
 
-use super::{Base, Fog, Frustum, GltfScene, Meshes, Voxels, fog, voxels};
+use super::{Base, Fog, Frustum, GltfScene, Meshes, Selection, Voxels, fog, voxels};
 use crate::{Asset, Config, Loader, Sim};
 use common::SimConfig;
 use common::proto::{Character, Position};
@@ -40,6 +40,7 @@ pub struct Draw {
     /// Populated after connect, once the voxel configuration is known
     voxels: Option<Voxels>,
     meshes: Meshes,
+    selection: Selection,
     fog: Fog,
 
     /// Reusable storage for barriers that prevent races between image upload and read
@@ -178,6 +179,7 @@ impl Draw {
                 .collect();
 
             let meshes = Meshes::new(&gfx, loader.ctx().mesh_ds_layout);
+            let selection = Selection::new(&gfx);
 
             let fog = Fog::new(&gfx);
 
@@ -216,6 +218,7 @@ impl Draw {
 
                 voxels: None,
                 meshes,
+                selection,
                 fog,
 
                 buffer_barriers: Vec::new(),
@@ -508,6 +511,19 @@ impl Draw {
                 }
             }
 
+            if let Some(sim) = sim.as_deref()
+                && sim.geometry_preview_enabled()
+                && let Some(hit) = sim.looking_at()
+            {
+                self.selection.draw(
+                    device,
+                    cmd,
+                    projection.matrix(),
+                    u32::from(sim.cfg.chunk_size),
+                    &hit,
+                );
+            }
+
             device.cmd_next_subpass(cmd, vk::SubpassContents::INLINE);
 
             self.fog.draw(device, state.common_ds, cmd);
@@ -604,6 +620,7 @@ impl Drop for Draw {
             device.destroy_descriptor_pool(self.common_descriptor_pool, None);
             device.destroy_pipeline_layout(self.common_pipeline_layout, None);
             self.fog.destroy(device);
+            self.selection.destroy(device);
             self.meshes.destroy(device);
             if let Some(mut voxels) = self.voxels.take() {
                 voxels.destroy(device);

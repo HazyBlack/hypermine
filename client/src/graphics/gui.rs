@@ -255,7 +255,11 @@ impl GuiState {
             .as_deref()
             .is_none_or(|sim| !sim.cfg.gameplay_enabled || layout.creative_tab);
         if self.show_hud && !self.menu_open() {
-            self.hud(&layout, unlimited);
+            let preview = sim.as_deref().and_then(|sim| {
+                sim.geometry_preview_enabled()
+                    .then(|| sim.looking_at().is_some())
+            });
+            self.hud(&layout, unlimited, preview);
         }
         if !self.menu_open()
             && let Some(sim) = sim.as_deref()
@@ -316,7 +320,12 @@ impl GuiState {
         action
     }
 
-    fn hud(&self, layout: &crate::inventory::InventoryLayout, unlimited: bool) {
+    fn hud(
+        &self,
+        layout: &crate::inventory::InventoryLayout,
+        unlimited: bool,
+        geometry_preview: Option<bool>,
+    ) {
         align(Alignment::CENTER, || {
             colored_box(Color::WHITE.with_alpha(0.9), [3.0, 15.0]);
             colored_box(Color::WHITE.with_alpha(0.9), [15.0, 3.0]);
@@ -331,6 +340,17 @@ impl GuiState {
                 list.cross_axis_alignment = CrossAxisAlignment::Center;
                 list.main_axis_size = MainAxisSize::Min;
                 list.show(|| {
+                    if let Some(has_target) = geometry_preview {
+                        colored_box_container(Color::BLACK.with_alpha(0.72), || {
+                            pad(Pad::balanced(10.0, 4.0), || {
+                                label(if has_target {
+                                    "Geometry Preview — Single Block — 1 selected"
+                                } else {
+                                    "Geometry Preview — Single Block — no target"
+                                });
+                            });
+                        });
+                    }
                     if let Some(material) = layout.selected_stack().material {
                         colored_box_container(Color::BLACK.with_alpha(0.72), || {
                             pad(Pad::balanced(10.0, 4.0), || {

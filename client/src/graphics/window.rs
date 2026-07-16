@@ -359,6 +359,11 @@ impl Window {
         if bound(Action::GuideHome) {
             self.gui_state.toggle_guide_home();
         }
+        if bound(Action::GeometryPreview)
+            && let Some(sim) = self.sim.as_mut()
+        {
+            sim.toggle_geometry_preview();
+        }
         if bound(Action::OpenInventory) {
             self.open_inventory();
             return;
