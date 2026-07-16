@@ -246,8 +246,8 @@ impl GuiState {
             && let Some(sim) = sim.as_deref()
         {
             let guidance = sim.home_guidance();
-            if self.show_navigation {
-                self.navigation_overlay(guidance);
+            if self.show_navigation || self.show_debug {
+                self.coordinate_overlays(sim, guidance);
             }
             if self.guide_home {
                 self.home_marker(
@@ -257,12 +257,6 @@ impl GuiState {
                     settings.value.video.fov_degrees,
                 );
             }
-        }
-        if self.show_debug
-            && !self.menu_open()
-            && let Some(sim) = sim.as_deref()
-        {
-            self.debug_overlay(sim);
         }
         if !self.menu_open() {
             return action;
@@ -335,78 +329,86 @@ impl GuiState {
         });
     }
 
-    fn debug_overlay(&self, sim: &Sim) {
-        let coordinates = sim.debug_coordinates();
+    fn coordinate_overlays(&self, sim: &Sim, guidance: crate::sim::HomeGuidance) {
         align(Alignment::TOP_LEFT, || {
             pad(Pad::all(12.0), || {
-                colored_box_container(Color::BLACK.with_alpha(0.78), || {
-                    pad(Pad::all(10.0), || {
-                        let mut list = List::column();
-                        list.item_spacing = 3.0;
-                        list.main_axis_size = MainAxisSize::Min;
-                        list.show(|| {
-                            text(19.0, "Hypermine Developer (H^3)");
-                            if let Some(coordinates) = coordinates {
-                                let high = coordinates.node_hash >> 64;
-                                let low = coordinates.node_hash as u64;
-                                label(format!("Cell: {high:016x}:{low:016x}"));
-                                label(format!(
-                                    "Cell depth from spawn: {} dodecahedra",
-                                    coordinates.node_depth
-                                ));
-                                label(format!(
-                                    "Klein local:  x {:+.5}   y {:+.5}   z {:+.5}",
-                                    coordinates.klein[0],
-                                    coordinates.klein[1],
-                                    coordinates.klein[2]
-                                ));
-                                label(format!(
-                                    "Lorentz H^3: ({:+.5}, {:+.5}, {:+.5}, {:+.5})",
-                                    coordinates.lorentz[0],
-                                    coordinates.lorentz[1],
-                                    coordinates.lorentz[2],
-                                    coordinates.lorentz[3]
-                                ));
-                                label(format!(
-                                    "Local hyperbolic radius: {:.5}",
-                                    coordinates.local_hyperbolic_radius
-                                ));
-                            } else {
-                                label("Coordinates are numerically unstable at this position.");
-                                label("Use Creative Inventory > Return to Spawn to recover.");
-                            }
-                            label("Position = cell address + local H^3 coordinates");
-                            label("F4 - hide developer overlay");
-                        });
-                    });
+                let mut stack = List::column();
+                stack.item_spacing = 8.0;
+                stack.main_axis_size = MainAxisSize::Min;
+                stack.show(|| {
+                    if self.show_navigation {
+                        self.navigation_panel(guidance);
+                    }
+                    if self.show_debug {
+                        self.debug_panel(sim);
+                    }
                 });
             });
         });
     }
 
-    fn navigation_overlay(&self, guidance: crate::sim::HomeGuidance) {
-        align(Alignment::TOP_LEFT, || {
-            pad(Pad::all(12.0), || {
-                colored_box_container(Color::BLACK.with_alpha(0.78), || {
-                    pad(Pad::all(10.0), || {
-                        let mut list = List::column();
-                        list.item_spacing = 3.0;
-                        list.main_axis_size = MainAxisSize::Min;
-                        list.show(|| {
-                            text(19.0, "Location & Navigation");
-                            if guidance.crossings_remaining == 0 {
-                                label("You are at Spawn");
-                            } else {
-                                label(format!("Home: {} exits away", guidance.crossings_remaining));
-                                if self.guide_home {
-                                    label("Follow the HOME marker");
-                                } else {
-                                    label("Press H to show the way home");
-                                }
-                            }
-                            label("F3 - hide navigation");
-                        });
-                    });
+    fn debug_panel(&self, sim: &Sim) {
+        let coordinates = sim.debug_coordinates();
+        colored_box_container(Color::BLACK.with_alpha(0.78), || {
+            pad(Pad::all(10.0), || {
+                let mut list = List::column();
+                list.item_spacing = 3.0;
+                list.main_axis_size = MainAxisSize::Min;
+                list.show(|| {
+                    text(19.0, "Hypermine Developer (H^3)");
+                    if let Some(coordinates) = coordinates {
+                        let high = coordinates.node_hash >> 64;
+                        let low = coordinates.node_hash as u64;
+                        label(format!("Cell: {high:016x}:{low:016x}"));
+                        label(format!(
+                            "Cell depth from spawn: {} dodecahedra",
+                            coordinates.node_depth
+                        ));
+                        label(format!(
+                            "Klein local:  x {:+.5}   y {:+.5}   z {:+.5}",
+                            coordinates.klein[0], coordinates.klein[1], coordinates.klein[2]
+                        ));
+                        label(format!(
+                            "Lorentz H^3: ({:+.5}, {:+.5}, {:+.5}, {:+.5})",
+                            coordinates.lorentz[0],
+                            coordinates.lorentz[1],
+                            coordinates.lorentz[2],
+                            coordinates.lorentz[3]
+                        ));
+                        label(format!(
+                            "Local hyperbolic radius: {:.5}",
+                            coordinates.local_hyperbolic_radius
+                        ));
+                    } else {
+                        label("Coordinates are numerically unstable at this position.");
+                        label("Use Creative Inventory > Return to Spawn to recover.");
+                    }
+                    label("Position = cell address + local H^3 coordinates");
+                    label("F4 - hide developer overlay");
+                });
+            });
+        });
+    }
+
+    fn navigation_panel(&self, guidance: crate::sim::HomeGuidance) {
+        colored_box_container(Color::BLACK.with_alpha(0.78), || {
+            pad(Pad::all(10.0), || {
+                let mut list = List::column();
+                list.item_spacing = 3.0;
+                list.main_axis_size = MainAxisSize::Min;
+                list.show(|| {
+                    text(19.0, "Location & Navigation");
+                    if guidance.crossings_remaining == 0 {
+                        label("You are at Spawn");
+                    } else {
+                        label(format!("Home: {} exits away", guidance.crossings_remaining));
+                        if self.guide_home {
+                            label("Follow the HOME marker");
+                        } else {
+                            label("Press H to show the way home");
+                        }
+                    }
+                    label("F3 - hide navigation");
                 });
             });
         });
