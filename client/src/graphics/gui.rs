@@ -37,6 +37,7 @@ pub struct GuiAction {
 
 pub struct GuiState {
     show_hud: bool,
+    show_debug: bool,
     screen: MenuScreen,
     rebinding: Option<Action>,
     new_world_name: String,
@@ -53,6 +54,7 @@ impl GuiState {
     pub fn new(icons: MaterialIcons) -> Self {
         Self {
             show_hud: true,
+            show_debug: false,
             screen: MenuScreen::Closed,
             rebinding: None,
             new_world_name: "New World".to_owned(),
@@ -179,6 +181,10 @@ impl GuiState {
         self.show_hud = !self.show_hud;
     }
 
+    pub fn toggle_debug(&mut self) {
+        self.show_debug = !self.show_debug;
+    }
+
     pub fn handle_escape(&mut self) {
         self.rebinding = None;
         self.status = None;
@@ -223,6 +229,12 @@ impl GuiState {
             .is_none_or(|sim| !sim.cfg.gameplay_enabled || layout.creative_tab);
         if self.show_hud && !self.menu_open() {
             self.hud(&layout, unlimited);
+        }
+        if self.show_debug
+            && !self.menu_open()
+            && let Some(sim) = sim.as_deref()
+        {
+            self.debug_overlay(sim);
         }
         if !self.menu_open() {
             return action;
@@ -295,6 +307,55 @@ impl GuiState {
         });
     }
 
+    fn debug_overlay(&self, sim: &Sim) {
+        let coordinates = sim.debug_coordinates();
+        align(Alignment::TOP_LEFT, || {
+            pad(Pad::all(12.0), || {
+                colored_box_container(Color::BLACK.with_alpha(0.78), || {
+                    pad(Pad::all(10.0), || {
+                        let mut list = List::column();
+                        list.item_spacing = 3.0;
+                        list.main_axis_size = MainAxisSize::Min;
+                        list.show(|| {
+                            text(19.0, "Hypermine Developer (H^3)");
+                            if let Some(coordinates) = coordinates {
+                                let high = coordinates.node_hash >> 64;
+                                let low = coordinates.node_hash as u64;
+                                label(format!("Cell: {high:016x}:{low:016x}"));
+                                label(format!(
+                                    "Cell depth from spawn: {} dodecahedra",
+                                    coordinates.node_depth
+                                ));
+                                label(format!(
+                                    "Klein local:  x {:+.5}   y {:+.5}   z {:+.5}",
+                                    coordinates.klein[0],
+                                    coordinates.klein[1],
+                                    coordinates.klein[2]
+                                ));
+                                label(format!(
+                                    "Lorentz H^3: ({:+.5}, {:+.5}, {:+.5}, {:+.5})",
+                                    coordinates.lorentz[0],
+                                    coordinates.lorentz[1],
+                                    coordinates.lorentz[2],
+                                    coordinates.lorentz[3]
+                                ));
+                                label(format!(
+                                    "Local hyperbolic radius: {:.5}",
+                                    coordinates.local_hyperbolic_radius
+                                ));
+                            } else {
+                                label("Coordinates are numerically unstable at this position.");
+                                label("Use Creative Inventory > Return to Spawn to recover.");
+                            }
+                            label("Position = cell address + local H^3 coordinates");
+                            label("F3 - hide developer overlay");
+                        });
+                    });
+                });
+            });
+        });
+    }
+
     fn hotbar(
         &self,
         layout: &crate::inventory::InventoryLayout,
@@ -346,6 +407,7 @@ impl GuiState {
         let mut hovered = None;
         let mut changed = false;
         let mut close = false;
+        let mut return_to_spawn = false;
         let slot_size = (46.0 / settings.value.video.ui_scale.sqrt()).clamp(34.0, 52.0);
         inventory_panel(
             if layout.creative_tab {
@@ -393,6 +455,10 @@ impl GuiState {
                             changed = true;
                         }
                     });
+                    if menu_button("Return to Spawn") {
+                        return_to_spawn = true;
+                        close = true;
+                    }
                 } else {
                     label("Storage");
                     slot_grid(3, 9, slot_size, |grid_index| {
@@ -454,6 +520,9 @@ impl GuiState {
         if let Some(sim) = sim {
             sim.set_creative_mode(layout.creative_tab);
             sim.set_selected_material(layout.selected_stack().material.unwrap_or(Material::Void));
+            if return_to_spawn {
+                sim.request_return_to_spawn();
+            }
         }
         settings
             .value

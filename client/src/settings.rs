@@ -128,6 +128,7 @@ pub enum Action {
     RollRight,
     OpenInventory,
     ToggleHud,
+    DeveloperOverlay,
     PreviousMaterial,
     NextMaterial,
     PickMaterial,
@@ -143,7 +144,7 @@ pub enum Action {
 }
 
 impl Action {
-    pub const ALL: [Self; 24] = [
+    pub const ALL: [Self; 25] = [
         Self::Forward,
         Self::Backward,
         Self::Left,
@@ -156,6 +157,7 @@ impl Action {
         Self::RollRight,
         Self::OpenInventory,
         Self::ToggleHud,
+        Self::DeveloperOverlay,
         Self::PreviousMaterial,
         Self::NextMaterial,
         Self::PickMaterial,
@@ -184,6 +186,7 @@ impl Action {
             Self::RollRight => "roll_right",
             Self::OpenInventory => "open_inventory",
             Self::ToggleHud => "toggle_hud",
+            Self::DeveloperOverlay => "developer_overlay",
             Self::PreviousMaterial => "previous_material",
             Self::NextMaterial => "next_material",
             Self::PickMaterial => "pick_material",
@@ -213,6 +216,7 @@ impl Action {
             Self::RollRight => "Roll Right",
             Self::OpenInventory => "Open Inventory",
             Self::ToggleHud => "Toggle HUD",
+            Self::DeveloperOverlay => "Developer Coordinates",
             Self::PreviousMaterial => "Previous Hotbar Slot",
             Self::NextMaterial => "Next Hotbar Slot",
             Self::PickMaterial => "Pick Looked-at Material",
@@ -242,6 +246,7 @@ impl Action {
             Self::RollRight => "KeyE",
             Self::OpenInventory => "KeyI",
             Self::ToggleHud => "F1",
+            Self::DeveloperOverlay => "F3",
             Self::PreviousMaterial => "Minus",
             Self::NextMaterial => "Equal",
             Self::PickMaterial => "KeyG",

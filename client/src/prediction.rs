@@ -120,6 +120,7 @@ mod tests {
             jump: false,
             no_clip: true,
             creative: false,
+            return_to_spawn: false,
             block_update: None,
         };
 

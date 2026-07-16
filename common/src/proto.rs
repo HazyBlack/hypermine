@@ -74,6 +74,8 @@ pub struct CharacterInput {
     pub no_clip: bool,
     #[serde(default)]
     pub creative: bool,
+    #[serde(default)]
+    pub return_to_spawn: bool,
     pub block_update: Option<BlockUpdate>,
 }
 

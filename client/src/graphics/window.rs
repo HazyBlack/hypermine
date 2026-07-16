@@ -350,6 +350,9 @@ impl Window {
         if bound(Action::ToggleHud) {
             self.gui_state.toggle_hud();
         }
+        if bound(Action::DeveloperOverlay) {
+            self.gui_state.toggle_debug();
+        }
         if bound(Action::OpenInventory) {
             self.open_inventory();
             return;

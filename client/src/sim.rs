@@ -36,6 +36,15 @@ const MATERIAL_PALETTE: [Material; 10] = [
     Material::Lava,
 ];
 
+#[derive(Debug, Clone, Copy)]
+pub struct DebugCoordinates {
+    pub node_hash: u128,
+    pub node_depth: u32,
+    pub klein: [f32; 3],
+    pub lorentz: [f32; 4],
+    pub local_hyperbolic_radius: f32,
+}
+
 /// Game state
 pub struct Sim {
     // World state
@@ -63,6 +72,7 @@ pub struct Sim {
     average_movement_input: na::Vector3<f32>,
     no_clip: bool,
     creative_mode: bool,
+    return_to_spawn_requested: bool,
     /// Whether no_clip will be toggled next step
     toggle_no_clip: bool,
     /// Whether the current step starts with a jump
@@ -106,6 +116,7 @@ impl Sim {
             average_movement_input: na::zero(),
             no_clip: true,
             creative_mode: true,
+            return_to_spawn_requested: false,
             toggle_no_clip: false,
             is_jumping: false,
             jump_pressed: false,
@@ -212,6 +223,11 @@ impl Sim {
         self.creative_mode
     }
 
+    pub fn request_return_to_spawn(&mut self) {
+        self.return_to_spawn_requested = true;
+        self.local_character_controller.reset_orientation();
+    }
+
     pub fn looked_at_material(&self) -> Option<Material> {
         let hit = self.looking_at()?;
         self.graph
@@ -294,6 +310,21 @@ impl Sim {
 
     pub fn cfg(&self) -> &SimConfig {
         &self.cfg
+    }
+
+    pub fn debug_coordinates(&self) -> Option<DebugCoordinates> {
+        let position = *self.prediction.predicted_position();
+        let point: na::Vector4<f32> = (position.local * MPoint::origin()).into();
+        if !point.iter().all(|component| component.is_finite()) || point.w.abs() < f32::EPSILON {
+            return None;
+        }
+        Some(DebugCoordinates {
+            node_hash: self.graph.hash_of(position.node),
+            node_depth: self.graph.depth(position.node),
+            klein: [point.x / point.w, point.y / point.w, point.z / point.w],
+            lorentz: [point.x, point.y, point.z, point.w],
+            local_hyperbolic_radius: point.w.max(1.0).acosh(),
+        })
     }
 
     pub fn step(&mut self, dt: Duration, net: &mut server::Handle) {
@@ -541,6 +572,7 @@ impl Sim {
             jump: self.is_jumping,
             no_clip: self.no_clip,
             creative: self.creative_mode,
+            return_to_spawn: self.return_to_spawn_requested,
             block_update: self.get_local_character_block_update(),
         };
         let generation = self
@@ -553,6 +585,7 @@ impl Sim {
             character_input,
             orientation: self.local_character_controller.orientation(),
         });
+        self.return_to_spawn_requested = false;
     }
 
     fn update_view_position(&mut self) {
@@ -575,6 +608,7 @@ impl Sim {
             jump: self.is_jumping,
             no_clip: self.no_clip,
             creative: self.creative_mode,
+            return_to_spawn: false,
             block_update: None,
         };
         character_controller::run_character_step(

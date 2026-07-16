@@ -543,15 +543,19 @@ impl Sim {
             )>()
             .iter()
         {
-            character_controller::run_character_step(
-                &self.cfg,
-                &self.graph,
-                position,
-                &mut character.state.velocity,
-                &mut character.state.on_ground,
-                input,
-                self.cfg.step_interval.as_secs_f32(),
-            );
+            if input.return_to_spawn && input.creative {
+                return_character_to_spawn(position, &mut character.state);
+            } else {
+                character_controller::run_character_step(
+                    &self.cfg,
+                    &self.graph,
+                    position,
+                    &mut character.state.velocity,
+                    &mut character.state.on_ground,
+                    input,
+                    self.cfg.step_interval.as_secs_f32(),
+                );
+            }
             if let Some(block_update) = input.block_update.clone() {
                 pending_block_updates.push((entity, block_update, input.creative));
             }
@@ -730,6 +734,44 @@ impl Sim {
         self.modified_chunks.insert(block_update.chunk_id);
         self.dirty_voxel_nodes.insert(block_update.chunk_id.node);
         self.accumulated_changes.block_updates.push(block_update);
+    }
+}
+
+fn character_spawn_position() -> Position {
+    Position {
+        node: NodeId::ROOT,
+        local: MIsometry::translation_along(&(na::Vector3::y() * 1.4)),
+    }
+}
+
+fn return_character_to_spawn(position: &mut Position, state: &mut CharacterState) {
+    *position = character_spawn_position();
+    state.velocity = na::Vector3::zeros();
+    state.on_ground = false;
+    state.orientation = na::UnitQuaternion::identity();
+}
+
+#[cfg(test)]
+mod return_to_spawn_tests {
+    use super::*;
+
+    #[test]
+    fn resets_position_motion_and_orientation() {
+        let mut position = Position::origin();
+        let mut state = CharacterState {
+            velocity: na::Vector3::new(2.0, -3.0, 4.0),
+            on_ground: true,
+            orientation: na::UnitQuaternion::from_axis_angle(&na::Vector3::x_axis(), 1.0),
+        };
+
+        return_character_to_spawn(&mut position, &mut state);
+
+        let spawn = character_spawn_position();
+        assert_eq!(position.node, spawn.node);
+        assert_eq!(position.local, spawn.local);
+        assert_eq!(state.velocity, na::Vector3::zeros());
+        assert!(!state.on_ground);
+        assert_eq!(state.orientation, na::UnitQuaternion::identity());
     }
 }
 
