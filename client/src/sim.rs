@@ -62,6 +62,7 @@ pub struct Sim {
     /// Units are relative to movement speed.
     average_movement_input: na::Vector3<f32>,
     no_clip: bool,
+    creative_mode: bool,
     /// Whether no_clip will be toggled next step
     toggle_no_clip: bool,
     /// Whether the current step starts with a jump
@@ -104,6 +105,7 @@ impl Sim {
             movement_input: na::zero(),
             average_movement_input: na::zero(),
             no_clip: true,
+            creative_mode: true,
             toggle_no_clip: false,
             is_jumping: false,
             jump_pressed: false,
@@ -197,19 +199,51 @@ impl Sim {
 
     /// selects the material of the block the player is looking at. Will never select void.
     pub fn pick_material(&mut self) {
-        let Some(hit) = self.looking_at() else {
-            return;
-        };
+        if let Some(material) = self.looked_at_material() {
+            self.selected_material = material;
+        }
+    }
 
-        let mat = self.graph.get_material(hit.chunk, hit.voxel_coords);
-        let Some(mat) = mat else {
-            return;
-        };
-        self.selected_material = mat;
+    pub fn set_creative_mode(&mut self, creative: bool) {
+        self.creative_mode = creative;
+    }
+
+    pub fn creative_mode(&self) -> bool {
+        self.creative_mode
+    }
+
+    pub fn looked_at_material(&self) -> Option<Material> {
+        let hit = self.looking_at()?;
+        self.graph
+            .get_material(hit.chunk, hit.voxel_coords)
+            .filter(|material| *material != Material::Void)
     }
 
     pub fn selected_material(&self) -> Material {
         self.selected_material
+    }
+
+    pub fn set_selected_material(&mut self, material: Material) {
+        self.selected_material = material;
+    }
+
+    pub fn inventory_material_counts(&self) -> [usize; Material::COUNT] {
+        let mut counts = [0; Material::COUNT];
+        let Some(local_character) = self.local_character else {
+            return counts;
+        };
+        let Ok(inventory) = self.world.get::<&Inventory>(local_character) else {
+            return counts;
+        };
+        for id in &inventory.contents {
+            let Some(&entity) = self.entity_ids.get(id) else {
+                continue;
+            };
+            if let Ok(material) = self.world.get::<&Material>(entity) {
+                counts[*material as usize] += 1;
+            }
+        }
+        counts
     }
 
     /// Returns an EntityId in the inventory with the given material
@@ -506,6 +540,7 @@ impl Sim {
             movement: sanitize_motion_input(orientation * self.average_movement_input),
             jump: self.is_jumping,
             no_clip: self.no_clip,
+            creative: self.creative_mode,
             block_update: self.get_local_character_block_update(),
         };
         let generation = self
@@ -539,6 +574,7 @@ impl Sim {
                 / (self.since_input_sent.as_secs_f32() / self.cfg.step_interval.as_secs_f32()),
             jump: self.is_jumping,
             no_clip: self.no_clip,
+            creative: self.creative_mode,
             block_update: None,
         };
         character_controller::run_character_step(
@@ -611,12 +647,15 @@ impl Sim {
         };
 
         let material = if placing {
+            if self.selected_material == Material::Void {
+                return None;
+            }
             self.selected_material
         } else {
             Material::Void
         };
 
-        let consumed_entity = if placing && self.cfg.gameplay_enabled {
+        let consumed_entity = if placing && self.cfg.gameplay_enabled && !self.creative_mode {
             Some(self.get_any_inventory_entity_matching_material(material)?)
         } else {
             None

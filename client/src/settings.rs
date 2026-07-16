@@ -5,11 +5,14 @@ use tracing::{info, warn};
 
 use common::Anonymize;
 
+use crate::inventory::InventorySettings;
+
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(default)]
 pub struct UserSettings {
     pub video: VideoSettings,
     pub controls: ControlSettings,
+    pub inventory: InventorySettings,
 }
 
 impl UserSettings {
@@ -123,6 +126,7 @@ pub enum Action {
     MoveDown,
     RollLeft,
     RollRight,
+    OpenInventory,
     ToggleHud,
     PreviousMaterial,
     NextMaterial,
@@ -136,7 +140,6 @@ pub enum Action {
     Material7,
     Material8,
     Material9,
-    Material10,
 }
 
 impl Action {
@@ -151,6 +154,7 @@ impl Action {
         Self::MoveDown,
         Self::RollLeft,
         Self::RollRight,
+        Self::OpenInventory,
         Self::ToggleHud,
         Self::PreviousMaterial,
         Self::NextMaterial,
@@ -164,7 +168,6 @@ impl Action {
         Self::Material7,
         Self::Material8,
         Self::Material9,
-        Self::Material10,
     ];
 
     pub fn id(self) -> &'static str {
@@ -179,6 +182,7 @@ impl Action {
             Self::MoveDown => "move_down",
             Self::RollLeft => "roll_left",
             Self::RollRight => "roll_right",
+            Self::OpenInventory => "open_inventory",
             Self::ToggleHud => "toggle_hud",
             Self::PreviousMaterial => "previous_material",
             Self::NextMaterial => "next_material",
@@ -192,7 +196,6 @@ impl Action {
             Self::Material7 => "material_7",
             Self::Material8 => "material_8",
             Self::Material9 => "material_9",
-            Self::Material10 => "material_10",
         }
     }
 
@@ -208,20 +211,20 @@ impl Action {
             Self::MoveDown => "Fly Down",
             Self::RollLeft => "Roll Left",
             Self::RollRight => "Roll Right",
+            Self::OpenInventory => "Open Inventory",
             Self::ToggleHud => "Toggle HUD",
-            Self::PreviousMaterial => "Previous Material",
-            Self::NextMaterial => "Next Material",
+            Self::PreviousMaterial => "Previous Hotbar Slot",
+            Self::NextMaterial => "Next Hotbar Slot",
             Self::PickMaterial => "Pick Looked-at Material",
-            Self::Material1 => "Material Slot 1",
-            Self::Material2 => "Material Slot 2",
-            Self::Material3 => "Material Slot 3",
-            Self::Material4 => "Material Slot 4",
-            Self::Material5 => "Material Slot 5",
-            Self::Material6 => "Material Slot 6",
-            Self::Material7 => "Material Slot 7",
-            Self::Material8 => "Material Slot 8",
-            Self::Material9 => "Material Slot 9",
-            Self::Material10 => "Material Slot 10",
+            Self::Material1 => "Hotbar Slot 1",
+            Self::Material2 => "Hotbar Slot 2",
+            Self::Material3 => "Hotbar Slot 3",
+            Self::Material4 => "Hotbar Slot 4",
+            Self::Material5 => "Hotbar Slot 5",
+            Self::Material6 => "Hotbar Slot 6",
+            Self::Material7 => "Hotbar Slot 7",
+            Self::Material8 => "Hotbar Slot 8",
+            Self::Material9 => "Hotbar Slot 9",
         }
     }
 
@@ -237,6 +240,7 @@ impl Action {
             Self::MoveDown => "KeyF",
             Self::RollLeft => "KeyQ",
             Self::RollRight => "KeyE",
+            Self::OpenInventory => "KeyI",
             Self::ToggleHud => "F1",
             Self::PreviousMaterial => "Minus",
             Self::NextMaterial => "Equal",
@@ -250,7 +254,6 @@ impl Action {
             Self::Material7 => "Digit7",
             Self::Material8 => "Digit8",
             Self::Material9 => "Digit9",
-            Self::Material10 => "Digit0",
         }
     }
 
@@ -265,7 +268,6 @@ impl Action {
             Self::Material7 => Some(6),
             Self::Material8 => Some(7),
             Self::Material9 => Some(8),
-            Self::Material10 => Some(9),
             _ => None,
         }
     }

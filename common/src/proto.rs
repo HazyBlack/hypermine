@@ -72,6 +72,8 @@ pub struct CharacterInput {
     pub movement: na::Vector3<f32>,
     pub jump: bool,
     pub no_clip: bool,
+    #[serde(default)]
+    pub creative: bool,
     pub block_update: Option<BlockUpdate>,
 }
 

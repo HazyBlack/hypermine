@@ -13,6 +13,7 @@ macro_rules! cstr {
 extern crate nalgebra as na;
 mod config;
 pub mod graphics;
+pub mod inventory;
 mod lahar_deprecated;
 mod loader;
 mod local_character_controller;

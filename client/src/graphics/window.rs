@@ -15,8 +15,8 @@ use winit::{
     window::{CursorGrabMode, Fullscreen, Window as WinitWindow},
 };
 
-use super::gui::GuiState;
 use super::{Base, Core, Draw, Frustum};
+use super::{gui::GuiState, material_icons::MaterialIcons};
 use crate::{Action, Config, SettingsStore, Sim, WorldManager, settings::VideoSettings};
 
 /// OS window
@@ -90,6 +90,8 @@ impl Window {
             .unwrap()
         };
         let surface_fn = khr::surface::Instance::new(&core.entry, &core.instance);
+        let mut yak = yakui::Yakui::new();
+        let icons = MaterialIcons::load(&mut yak, &config);
 
         Self {
             _core: core,
@@ -101,8 +103,8 @@ impl Window {
             swapchain_needs_update: false,
             draw: None,
             sim: None,
-            gui_state: GuiState::new(),
-            yak: yakui::Yakui::new(),
+            gui_state: GuiState::new(icons),
+            yak,
             net,
             settings,
             worlds,
@@ -187,6 +189,8 @@ impl Window {
                 event_loop.exit();
             }
             WindowEvent::CursorMoved { position, .. } if self.gui_state.menu_open() => {
+                self.gui_state
+                    .set_cursor_position([position.x as f32, position.y as f32]);
                 self.yak.handle_event(yakui::event::Event::CursorMoved(Some(
                     [position.x as f32, position.y as f32].into(),
                 )));
@@ -204,6 +208,15 @@ impl Window {
                 };
                 self.yak
                     .handle_event(yakui::event::Event::MouseScroll { delta });
+            }
+            WindowEvent::MouseWheel { delta, .. } => {
+                let vertical = match delta {
+                    MouseScrollDelta::LineDelta(_, y) => y,
+                    MouseScrollDelta::PixelDelta(position) => position.y as f32,
+                };
+                if vertical != 0.0 {
+                    self.cycle_hotbar(if vertical > 0.0 { -1 } else { 1 });
+                }
             }
             WindowEvent::MouseInput { button, state, .. } if self.gui_state.menu_open() => {
                 if let Some(button) = yak_mouse_button(button) {
@@ -242,7 +255,16 @@ impl Window {
             } => {
                 let pressed = state == ElementState::Pressed;
                 if key == KeyCode::Escape && pressed && !repeat {
-                    self.gui_state.handle_escape();
+                    if self.gui_state.inventory_open() {
+                        let world_id = self.worlds.borrow().selected_id().to_owned();
+                        self.gui_state.close_inventory(
+                            self.sim.as_mut(),
+                            &mut self.settings.borrow_mut(),
+                            &world_id,
+                        );
+                    } else {
+                        self.gui_state.handle_escape();
+                    }
                     if self.gui_state.menu_open() {
                         self.release_cursor();
                     } else {
@@ -328,29 +350,69 @@ impl Window {
         if bound(Action::ToggleHud) {
             self.gui_state.toggle_hud();
         }
-        if bound(Action::PreviousMaterial)
-            && let Some(sim) = self.sim.as_mut()
-        {
-            sim.prev_material();
+        if bound(Action::OpenInventory) {
+            self.open_inventory();
+            return;
         }
-        if bound(Action::NextMaterial)
-            && let Some(sim) = self.sim.as_mut()
-        {
-            sim.next_material();
+        if bound(Action::PreviousMaterial) {
+            self.cycle_hotbar(-1);
+        }
+        if bound(Action::NextMaterial) {
+            self.cycle_hotbar(1);
         }
         if bound(Action::PickMaterial)
-            && let Some(sim) = self.sim.as_mut()
+            && let Some(material) = self.sim.as_ref().and_then(Sim::looked_at_material)
         {
-            sim.pick_material();
+            self.pick_material(material);
         }
         for action in Action::ALL {
             if bound(action)
                 && let Some(index) = action.material_index()
-                && let Some(sim) = self.sim.as_mut()
             {
-                sim.select_material(index);
+                self.select_hotbar_slot(index);
             }
         }
+    }
+
+    fn open_inventory(&mut self) {
+        let world_id = self.worlds.borrow().selected_id().to_owned();
+        self.gui_state.open_inventory(
+            self.sim.as_mut(),
+            &mut self.settings.borrow_mut(),
+            &world_id,
+        );
+        self.release_cursor();
+        self.input.clear_motion();
+    }
+
+    fn select_hotbar_slot(&mut self, index: usize) {
+        let world_id = self.worlds.borrow().selected_id().to_owned();
+        self.gui_state.select_hotbar_slot(
+            index,
+            self.sim.as_mut(),
+            &mut self.settings.borrow_mut(),
+            &world_id,
+        );
+    }
+
+    fn cycle_hotbar(&mut self, delta: i32) {
+        let world_id = self.worlds.borrow().selected_id().to_owned();
+        self.gui_state.cycle_hotbar(
+            delta,
+            self.sim.as_mut(),
+            &mut self.settings.borrow_mut(),
+            &world_id,
+        );
+    }
+
+    fn pick_material(&mut self, material: common::world::Material) {
+        let world_id = self.worlds.borrow().selected_id().to_owned();
+        self.gui_state.pick_material(
+            material,
+            self.sim.as_mut(),
+            &mut self.settings.borrow_mut(),
+            &world_id,
+        );
     }
 
     fn release_cursor(&mut self) {
@@ -410,7 +472,7 @@ impl Window {
         let menu_was_open = self.gui_state.menu_open();
         self.yak.start();
         let gui_action = self.gui_state.run(
-            self.sim.as_ref(),
+            self.sim.as_mut(),
             &mut self.settings.borrow_mut(),
             &mut self.worlds.borrow_mut(),
             [initial_extent.width as f32, initial_extent.height as f32],

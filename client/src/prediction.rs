@@ -119,6 +119,7 @@ mod tests {
             movement: na::Vector3::x(),
             jump: false,
             no_clip: true,
+            creative: false,
             block_update: None,
         };
 

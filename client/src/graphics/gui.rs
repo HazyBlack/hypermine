@@ -1,13 +1,19 @@
 use yakui::{
     Alignment, Color, Constraints, CrossAxisAlignment, MainAxisSize, align, colored_box,
-    colored_box_container, constrained, label, pad, slider, text, textbox,
+    colored_box_container, constrained, image, label, offset, pad, row, slider, stack, text,
+    textbox,
     widgets::{Button, List, Pad},
 };
 
+use common::world::Material;
+
 use crate::{
     Action, SettingsStore, Sim, WorldManager,
+    inventory::{HOTBAR_SLOTS, ItemStack, STACK_LIMIT},
     settings::{UserSettings, display_key},
 };
+
+use super::material_icons::MaterialIcons;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum MenuScreen {
@@ -17,6 +23,7 @@ enum MenuScreen {
     Video,
     Controls,
     Bindings,
+    Inventory,
     Worlds,
     CreateWorld,
 }
@@ -36,10 +43,14 @@ pub struct GuiState {
     status: Option<String>,
     control_page: usize,
     world_page: usize,
+    icons: MaterialIcons,
+    held_stack: Option<ItemStack>,
+    cursor_position: [f32; 2],
+    hovered_material: Option<Material>,
 }
 
 impl GuiState {
-    pub fn new() -> Self {
+    pub fn new(icons: MaterialIcons) -> Self {
         Self {
             show_hud: true,
             screen: MenuScreen::Closed,
@@ -48,11 +59,120 @@ impl GuiState {
             status: None,
             control_page: 0,
             world_page: 0,
+            icons,
+            held_stack: None,
+            cursor_position: [0.0, 0.0],
+            hovered_material: None,
         }
     }
 
     pub fn menu_open(&self) -> bool {
         self.screen != MenuScreen::Closed
+    }
+
+    pub fn inventory_open(&self) -> bool {
+        self.screen == MenuScreen::Inventory
+    }
+
+    pub fn set_cursor_position(&mut self, position: [f32; 2]) {
+        self.cursor_position = position;
+    }
+
+    pub fn open_inventory(
+        &mut self,
+        sim: Option<&mut Sim>,
+        settings: &mut SettingsStore,
+        world_id: &str,
+    ) {
+        self.screen = MenuScreen::Inventory;
+        self.reconcile_and_sync(sim, settings, world_id);
+    }
+
+    pub fn close_inventory(
+        &mut self,
+        sim: Option<&mut Sim>,
+        settings: &mut SettingsStore,
+        world_id: &str,
+    ) {
+        let unlimited = sim.as_deref().is_none_or(|sim| {
+            !sim.cfg.gameplay_enabled || settings.value.inventory.layout(world_id).creative_tab
+        });
+        settings
+            .value
+            .inventory
+            .layout_mut(world_id)
+            .return_held(&mut self.held_stack, unlimited);
+        self.screen = MenuScreen::Closed;
+        self.reconcile_and_sync(sim, settings, world_id);
+        settings.save();
+    }
+
+    pub fn select_hotbar_slot(
+        &mut self,
+        index: usize,
+        sim: Option<&mut Sim>,
+        settings: &mut SettingsStore,
+        world_id: &str,
+    ) {
+        settings
+            .value
+            .inventory
+            .layout_mut(world_id)
+            .select_hotbar(index);
+        self.reconcile_and_sync(sim, settings, world_id);
+        settings.save();
+    }
+
+    pub fn cycle_hotbar(
+        &mut self,
+        delta: i32,
+        sim: Option<&mut Sim>,
+        settings: &mut SettingsStore,
+        world_id: &str,
+    ) {
+        settings
+            .value
+            .inventory
+            .layout_mut(world_id)
+            .cycle_hotbar(delta);
+        self.reconcile_and_sync(sim, settings, world_id);
+        settings.save();
+    }
+
+    pub fn pick_material(
+        &mut self,
+        material: Material,
+        sim: Option<&mut Sim>,
+        settings: &mut SettingsStore,
+        world_id: &str,
+    ) {
+        let unlimited = sim.as_deref().is_none_or(|sim| {
+            !sim.cfg.gameplay_enabled || settings.value.inventory.layout(world_id).creative_tab
+        });
+        settings
+            .value
+            .inventory
+            .layout_mut(world_id)
+            .select_existing_or_replace(material, unlimited);
+        self.reconcile_and_sync(sim, settings, world_id);
+        settings.save();
+    }
+
+    fn reconcile_and_sync(
+        &mut self,
+        sim: Option<&mut Sim>,
+        settings: &mut SettingsStore,
+        world_id: &str,
+    ) {
+        let Some(sim) = sim else {
+            return;
+        };
+        let counts = sim.inventory_material_counts();
+        let layout = settings.value.inventory.layout_mut(world_id);
+        let unlimited = !sim.cfg.gameplay_enabled || layout.creative_tab;
+        layout.reconcile(&counts, unlimited, self.held_stack);
+        sim.set_creative_mode(layout.creative_tab);
+        sim.set_selected_material(layout.selected_stack().material.unwrap_or(Material::Void));
     }
 
     pub fn toggle_hud(&mut self) {
@@ -68,6 +188,7 @@ impl GuiState {
             MenuScreen::Options | MenuScreen::Worlds => MenuScreen::Pause,
             MenuScreen::Video | MenuScreen::Controls => MenuScreen::Options,
             MenuScreen::Bindings => MenuScreen::Controls,
+            MenuScreen::Inventory => MenuScreen::Closed,
             MenuScreen::CreateWorld => MenuScreen::Worlds,
         };
     }
@@ -88,14 +209,20 @@ impl GuiState {
     /// Prepare the GUI for rendering. This should be called between Yakui::start and Yakui::finish.
     pub fn run(
         &mut self,
-        sim: Option<&Sim>,
+        mut sim: Option<&mut Sim>,
         settings: &mut SettingsStore,
         worlds: &mut WorldManager,
         surface_size: [f32; 2],
     ) -> GuiAction {
         let mut action = GuiAction::default();
+        let world_id = worlds.selected_id().to_owned();
+        self.reconcile_and_sync(sim.as_deref_mut(), settings, &world_id);
+        let layout = settings.value.inventory.layout(&world_id);
+        let unlimited = sim
+            .as_deref()
+            .is_none_or(|sim| !sim.cfg.gameplay_enabled || layout.creative_tab);
         if self.show_hud && !self.menu_open() {
-            self.hud(sim);
+            self.hud(&layout, unlimited);
         }
         if !self.menu_open() {
             return action;
@@ -119,6 +246,9 @@ impl GuiState {
             MenuScreen::Bindings => {
                 self.bindings_menu(settings, &mut next_screen);
             }
+            MenuScreen::Inventory => {
+                self.inventory_menu(sim, settings, &world_id, &mut next_screen);
+            }
             MenuScreen::Worlds => {
                 self.worlds_menu(worlds, &mut next_screen, &mut action);
             }
@@ -131,31 +261,235 @@ impl GuiState {
             self.rebinding = None;
             self.status = None;
         }
+        if self.inventory_open() {
+            self.draw_held_stack(settings.value.video.ui_scale);
+        }
         action
     }
 
-    fn hud(&self, sim: Option<&Sim>) {
+    fn hud(&self, layout: &crate::inventory::InventoryLayout, unlimited: bool) {
         align(Alignment::CENTER, || {
             colored_box(Color::WHITE.with_alpha(0.9), [3.0, 15.0]);
             colored_box(Color::WHITE.with_alpha(0.9), [15.0, 3.0]);
         });
 
-        let Some(sim) = sim else {
+        align(Alignment::BOTTOM_CENTER, || {
+            let mut hotbar_padding = Pad::ZERO;
+            hotbar_padding.bottom = 14.0;
+            pad(hotbar_padding, || {
+                let mut list = List::column();
+                list.item_spacing = 5.0;
+                list.cross_axis_alignment = CrossAxisAlignment::Center;
+                list.main_axis_size = MainAxisSize::Min;
+                list.show(|| {
+                    if let Some(material) = layout.selected_stack().material {
+                        colored_box_container(Color::BLACK.with_alpha(0.72), || {
+                            pad(Pad::balanced(10.0, 4.0), || {
+                                label(material_name(material));
+                            });
+                        });
+                    }
+                    self.hotbar(layout, unlimited, false, 42.0);
+                });
+            });
+        });
+    }
+
+    fn hotbar(
+        &self,
+        layout: &crate::inventory::InventoryLayout,
+        unlimited: bool,
+        interactive: bool,
+        size: f32,
+    ) -> Option<usize> {
+        let mut clicked = None;
+        let mut hotbar = List::row();
+        hotbar.item_spacing = 2.0;
+        hotbar.main_axis_size = MainAxisSize::Min;
+        hotbar.show(|| {
+            for index in 0..HOTBAR_SLOTS {
+                let response = item_slot(
+                    &self.icons,
+                    layout.slots[index],
+                    layout.selected_hotbar == index,
+                    size,
+                    Some(index + 1),
+                    unlimited,
+                );
+                if interactive && response.clicked {
+                    clicked = Some(index);
+                }
+            }
+        });
+        clicked
+    }
+
+    fn inventory_menu(
+        &mut self,
+        sim: Option<&mut Sim>,
+        settings: &mut SettingsStore,
+        world_id: &str,
+        next: &mut Option<MenuScreen>,
+    ) {
+        let mut layout = settings.value.inventory.layout(world_id);
+        let counts = sim
+            .as_deref()
+            .map(Sim::inventory_material_counts)
+            .unwrap_or([0; Material::COUNT]);
+        let mut unlimited = sim
+            .as_deref()
+            .is_none_or(|sim| !sim.cfg.gameplay_enabled || layout.creative_tab);
+        layout.reconcile(&counts, unlimited, self.held_stack);
+
+        let icons = self.icons.clone();
+        let mut held = self.held_stack;
+        let mut hovered = None;
+        let mut changed = false;
+        let mut close = false;
+        let slot_size = (46.0 / settings.value.video.ui_scale.sqrt()).clamp(34.0, 52.0);
+        inventory_panel(
+            if layout.creative_tab {
+                "Creative Inventory"
+            } else {
+                "Inventory"
+            },
+            || {
+                row(|| {
+                    if menu_button(if layout.creative_tab {
+                        "Survival Inventory"
+                    } else {
+                        "Survival Inventory [active]"
+                    }) {
+                        layout.creative_tab = false;
+                        unlimited = sim.as_deref().is_none_or(|sim| !sim.cfg.gameplay_enabled);
+                        changed = true;
+                    }
+                    if menu_button(if layout.creative_tab {
+                        "Creative Inventory [active]"
+                    } else {
+                        "Creative Inventory"
+                    }) {
+                        layout.creative_tab = true;
+                        unlimited = true;
+                        changed = true;
+                    }
+                });
+
+                if layout.creative_tab {
+                    label("All Blocks");
+                    slot_grid(5, 9, slot_size, |index| {
+                        let material = Material::VALUES.get(index + 1).copied();
+                        let stack = material
+                            .map(|material| ItemStack::new(material, STACK_LIMIT))
+                            .unwrap_or(ItemStack::EMPTY);
+                        let response = item_slot(&icons, stack, false, slot_size, None, true);
+                        if response.hovering {
+                            hovered = material;
+                        }
+                        if response.clicked
+                            && let Some(material) = material
+                        {
+                            held = Some(ItemStack::new(material, STACK_LIMIT));
+                            changed = true;
+                        }
+                    });
+                } else {
+                    label("Storage");
+                    slot_grid(3, 9, slot_size, |grid_index| {
+                        let index = HOTBAR_SLOTS + grid_index;
+                        let stack = layout.slots[index];
+                        let response = item_slot(&icons, stack, false, slot_size, None, false);
+                        if response.hovering {
+                            hovered = stack.material;
+                        }
+                        if response.clicked {
+                            layout.left_click_slot(index, &mut held, false);
+                            changed = true;
+                        }
+                    });
+                }
+
+                label("Hotbar — select with 1–9 or the mouse wheel");
+                slot_grid(1, HOTBAR_SLOTS, slot_size, |index| {
+                    let stack = layout.slots[index];
+                    let response = item_slot(
+                        &icons,
+                        stack,
+                        layout.selected_hotbar == index,
+                        slot_size,
+                        Some(index + 1),
+                        unlimited,
+                    );
+                    if response.hovering {
+                        hovered = stack.material;
+                    }
+                    if response.clicked {
+                        if held.is_none() {
+                            layout.select_hotbar(index);
+                        } else {
+                            layout.left_click_slot(index, &mut held, unlimited);
+                        }
+                        changed = true;
+                    }
+                });
+
+                label(
+                    hovered
+                        .map(material_name)
+                        .unwrap_or_else(|| "Move stacks with the left mouse button".to_owned()),
+                );
+                if menu_button("Done") {
+                    close = true;
+                }
+            },
+        );
+
+        self.held_stack = held;
+        self.hovered_material = hovered;
+        if close {
+            layout.return_held(&mut self.held_stack, unlimited);
+            *next = Some(MenuScreen::Closed);
+            changed = true;
+        }
+        if let Some(sim) = sim {
+            sim.set_creative_mode(layout.creative_tab);
+            sim.set_selected_material(layout.selected_stack().material.unwrap_or(Material::Void));
+        }
+        settings
+            .value
+            .inventory
+            .worlds
+            .insert(world_id.to_owned(), layout);
+        if changed {
+            settings.save();
+        }
+    }
+
+    fn draw_held_stack(&self, ui_scale: f32) {
+        let Some(held_stack) = self.held_stack.filter(|stack| !stack.is_empty()) else {
             return;
         };
+        let Some(material) = held_stack.material else {
+            return;
+        };
+        let position = [
+            self.cursor_position[0] / ui_scale - 20.0,
+            self.cursor_position[1] / ui_scale - 20.0,
+        ];
         align(Alignment::TOP_LEFT, || {
-            pad(Pad::all(8.0), || {
-                colored_box_container(Color::BLACK.with_alpha(0.7), || {
-                    let material_count = if sim.cfg.gameplay_enabled {
-                        sim.count_inventory_entities_matching_material(sim.selected_material())
-                            .to_string()
-                    } else {
-                        "∞".to_owned()
-                    };
-                    label(format!(
-                        "Selected material: {:?} (×{material_count})",
-                        sim.selected_material()
-                    ));
+            offset(position.into(), || {
+                stack(|| {
+                    colored_box(Color::BLACK.with_alpha(0.72), [40.0, 40.0]);
+                    if let Some(icon) = self.icons.get(material) {
+                        align(Alignment::CENTER, || {
+                            image(icon, [32.0, 32.0]);
+                        });
+                    }
+                    align(Alignment::BOTTOM_RIGHT, || {
+                        pad(Pad::all(2.0), || {
+                            label(held_stack.count.to_string());
+                        });
+                    });
                 });
             });
         });
@@ -219,7 +553,7 @@ impl GuiState {
                 changed = true;
             }
 
-            label(format!("Interface Scale: {:.0}%", video.ui_scale * 100.0));
+            label(format!("GUI Scale: {:.0}%", video.ui_scale * 100.0));
             if let Some(value) = slider(video.ui_scale as f64, 0.75, 1.75).value {
                 video.ui_scale = (value as f32 * 20.0).round() / 20.0;
                 changed = true;
@@ -456,6 +790,140 @@ fn toggle_row(label_text: &str, value: &mut bool, changed: &mut bool) {
         *value = !*value;
         *changed = true;
     }
+}
+
+#[derive(Default)]
+struct SlotResponse {
+    clicked: bool,
+    hovering: bool,
+}
+
+fn item_slot(
+    icons: &MaterialIcons,
+    item_stack: ItemStack,
+    selected: bool,
+    size: f32,
+    number: Option<usize>,
+    unlimited: bool,
+) -> SlotResponse {
+    let mut result = SlotResponse::default();
+    constrained(
+        Constraints {
+            min: [size, size].into(),
+            max: [size, size].into(),
+        },
+        || {
+            stack(|| {
+                let mut button = Button::styled("");
+                button.padding = Pad::ZERO;
+                button.border_radius = 2.0;
+                button.style.fill = if selected {
+                    Color::rgba(205, 205, 218, 250)
+                } else {
+                    Color::rgba(54, 54, 61, 248)
+                };
+                button.hover_style.fill = Color::rgba(104, 104, 118, 250);
+                button.down_style.fill = Color::rgba(36, 36, 42, 250);
+                let response = button.show();
+                result.clicked = response.clicked;
+                result.hovering = response.hovering;
+
+                if let Some(material) = item_stack.material
+                    && let Some(icon) = icons.get(material)
+                {
+                    align(Alignment::CENTER, || {
+                        image(icon, [size * 0.68, size * 0.68]);
+                    });
+                }
+                if let Some(number) = number {
+                    align(Alignment::TOP_LEFT, || {
+                        pad(Pad::all(2.0), || {
+                            text(11.0, number.to_string());
+                        });
+                    });
+                }
+                if !item_stack.is_empty() {
+                    align(Alignment::BOTTOM_RIGHT, || {
+                        pad(Pad::all(2.0), || {
+                            text(
+                                12.0,
+                                if unlimited {
+                                    "∞".to_owned()
+                                } else {
+                                    item_stack.count.to_string()
+                                },
+                            );
+                        });
+                    });
+                }
+            });
+        },
+    );
+    result
+}
+
+fn slot_grid(rows: usize, columns: usize, size: f32, mut show_slot: impl FnMut(usize)) {
+    for row_index in 0..rows {
+        let dimensions = [
+            columns as f32 * size + columns.saturating_sub(1) as f32 * 2.0,
+            size,
+        ];
+        constrained(
+            Constraints {
+                min: dimensions.into(),
+                max: dimensions.into(),
+            },
+            || {
+                let mut row = List::row();
+                row.item_spacing = 2.0;
+                row.main_axis_size = MainAxisSize::Min;
+                row.show(|| {
+                    for column_index in 0..columns {
+                        show_slot(row_index * columns + column_index);
+                    }
+                });
+            },
+        );
+    }
+}
+
+fn inventory_panel(title: &str, children: impl FnOnce()) {
+    align(Alignment::CENTER, || {
+        constrained(
+            Constraints {
+                min: [520.0, 0.0].into(),
+                max: [620.0, 650.0].into(),
+            },
+            || {
+                colored_box_container(Color::rgba(26, 26, 31, 248), || {
+                    pad(Pad::all(14.0), || {
+                        let mut list = List::column();
+                        list.item_spacing = 6.0;
+                        list.main_axis_size = MainAxisSize::Min;
+                        list.cross_axis_alignment = CrossAxisAlignment::Stretch;
+                        list.show(|| {
+                            text(28.0, title.to_owned());
+                            children();
+                        });
+                    });
+                });
+            },
+        );
+    });
+}
+
+fn material_name(material: Material) -> String {
+    let raw = format!("{material:?}");
+    let mut result = String::with_capacity(raw.len() + 4);
+    let mut previous_was_lowercase = false;
+    for character in raw.chars() {
+        if character.is_uppercase() && previous_was_lowercase {
+            result.push(' ');
+        }
+        previous_was_lowercase = character.is_lowercase();
+        result.push(character);
+    }
+    result
 }
 
 #[allow(dead_code)]

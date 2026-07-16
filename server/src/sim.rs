@@ -529,7 +529,7 @@ impl Sim {
             }
         }
 
-        let mut pending_block_updates: Vec<(Entity, BlockUpdate)> = vec![];
+        let mut pending_block_updates: Vec<(Entity, BlockUpdate, bool)> = vec![];
 
         // Simulate
         for (entity, node, position, character, input) in self
@@ -553,14 +553,14 @@ impl Sim {
                 self.cfg.step_interval.as_secs_f32(),
             );
             if let Some(block_update) = input.block_update.clone() {
-                pending_block_updates.push((entity, block_update));
+                pending_block_updates.push((entity, block_update, input.creative));
             }
             self.dirty_nodes.insert(*node);
         }
 
-        for (entity, block_update) in pending_block_updates {
+        for (entity, block_update, creative) in pending_block_updates {
             let id = *self.world.get::<&EntityId>(entity).unwrap();
-            self.attempt_block_update(id, block_update);
+            self.attempt_block_update(id, block_update, creative);
         }
 
         self.update_entity_node_ids();
@@ -680,7 +680,12 @@ impl Sim {
 
     /// Executes the requested block update if the subject is able to do so and
     /// leaves the state of the world unchanged otherwise
-    fn attempt_block_update(&mut self, subject: EntityId, block_update: BlockUpdate) {
+    fn attempt_block_update(
+        &mut self,
+        subject: EntityId,
+        block_update: BlockUpdate,
+        creative: bool,
+    ) {
         let subject_node = *self
             .world
             .get::<&NodeId>(*self.entity_ids.get(&subject).unwrap())
@@ -692,7 +697,7 @@ impl Sim {
             tracing::warn!("Block update received from ungenerated chunk");
             return;
         };
-        if self.cfg.gameplay_enabled {
+        if self.cfg.gameplay_enabled && !creative {
             if block_update.new_material != Material::Void {
                 let Some(consumed_entity_id) = block_update.consumed_entity else {
                     tracing::warn!("Tried to place block without consuming any entities");
