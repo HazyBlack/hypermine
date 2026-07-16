@@ -489,7 +489,7 @@ impl Window {
         self.yak.finish();
 
         if gui_action.video_changed {
-            self.apply_video_settings();
+            self.apply_video_settings(gui_action.display_mode_changed);
         }
         if menu_was_open && !self.gui_state.menu_open() {
             self.capture_cursor();
@@ -571,18 +571,20 @@ impl Window {
         }
     }
 
-    fn apply_video_settings(&mut self) {
+    fn apply_video_settings(&mut self, display_mode_changed: bool) {
         let video = self.settings.borrow().value.video.clone();
         apply_video_to_sim_option(self.sim.as_mut(), &video);
-        self.window.set_fullscreen(if video.fullscreen {
-            Some(Fullscreen::Borderless(self.window.current_monitor()))
-        } else {
-            None
-        });
-        if !video.fullscreen {
-            let _ = self
-                .window
-                .request_inner_size(PhysicalSize::new(video.width, video.height));
+        if display_mode_changed {
+            self.window.set_fullscreen(if video.fullscreen {
+                Some(Fullscreen::Borderless(self.window.current_monitor()))
+            } else {
+                None
+            });
+            if !video.fullscreen {
+                let _ = self
+                    .window
+                    .request_inner_size(PhysicalSize::new(video.width, video.height));
+            }
         }
         self.swapchain_needs_update = true;
     }

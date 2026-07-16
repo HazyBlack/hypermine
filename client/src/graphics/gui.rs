@@ -33,6 +33,7 @@ pub struct GuiAction {
     pub quit: bool,
     pub restart: bool,
     pub video_changed: bool,
+    pub display_mode_changed: bool,
 }
 
 pub struct GuiState {
@@ -748,6 +749,7 @@ impl GuiState {
         action: &mut GuiAction,
     ) {
         let video = &mut settings.value.video;
+        let previous_display_mode = (video.fullscreen, video.width, video.height);
         let mut changed = false;
         menu_panel("Video Settings", || {
             label(format!("Render Distance: {:.0} m", video.view_distance_m));
@@ -790,8 +792,11 @@ impl GuiState {
             }
         });
         if changed {
+            let display_mode_changed =
+                previous_display_mode != (video.fullscreen, video.width, video.height);
             settings.save();
             action.video_changed = true;
+            action.display_mode_changed = display_mode_changed;
         }
     }
 
