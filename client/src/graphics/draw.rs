@@ -53,6 +53,7 @@ pub struct Draw {
 
     /// Miscellany
     character_model: Asset<GltfScene>,
+    nearby_cache: traversal::NearbyCache,
 }
 
 /// Maximum number of simultaneous frames in flight
@@ -225,6 +226,7 @@ impl Draw {
                 yakui_vulkan,
 
                 character_model,
+                nearby_cache: traversal::NearbyCache::default(),
             }
         }
     }
@@ -397,9 +399,19 @@ impl Draw {
 
             let nearby_nodes_started = Instant::now();
             let nearby_nodes = if let Some(sim) = sim.as_deref() {
-                traversal::nearby_nodes(&sim.graph, &view, sim.cfg.view_distance)
+                let padding = 5.0 * sim.cfg.meters_to_absolute;
+                if self.nearby_cache.needs_refresh(
+                    &sim.graph,
+                    &view,
+                    sim.cfg.view_distance,
+                    padding,
+                ) {
+                    self.nearby_cache
+                        .refresh(&sim.graph, &view, sim.cfg.view_distance, padding);
+                }
+                self.nearby_cache.nodes()
             } else {
-                vec![]
+                &[]
             };
             histogram!("frame.cpu.nearby_nodes").record(nearby_nodes_started.elapsed());
 
@@ -408,7 +420,7 @@ impl Draw {
                     device,
                     state.voxels.as_mut().unwrap(),
                     sim,
-                    &nearby_nodes,
+                    nearby_nodes,
                     state.post_cmd,
                     frustum,
                 );
@@ -483,7 +495,7 @@ impl Draw {
             }
 
             if let Some(sim) = sim.as_deref() {
-                for (node, transform) in nearby_nodes {
+                for &(node, ref transform) in nearby_nodes {
                     for &entity in sim.graph_entities.get(node) {
                         if sim.local_character == Some(entity) {
                             // Don't draw ourself
@@ -496,7 +508,7 @@ impl Draw {
                         if let Some(character_model) = self.loader.get(self.character_model)
                             && let Ok(ch) = sim.world.get::<&Character>(entity)
                         {
-                            let transform = na::Matrix4::from(transform * pos.local)
+                            let transform = na::Matrix4::from(*transform * pos.local)
                                 * na::Matrix4::new_scaling(sim.cfg().meters_to_absolute)
                                 * ch.state.orientation.to_homogeneous();
                             for mesh in &character_model.0 {

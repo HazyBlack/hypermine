@@ -4,16 +4,26 @@ use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 use tracing::warn;
 
+const WORLD_REGISTRY_VERSION: u32 = 1;
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct WorldEntry {
     pub id: String,
     pub name: String,
     pub save: PathBuf,
     pub created_unix_seconds: u64,
+    #[serde(default)]
+    pub format_version: u32,
+    #[serde(default)]
+    pub content_registry_version: u32,
+    #[serde(default)]
+    pub worldgen_version: u32,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
 struct WorldRegistry {
+    #[serde(default)]
+    version: u32,
     selected_id: String,
     worlds: Vec<WorldEntry>,
 }
@@ -39,12 +49,16 @@ impl WorldManager {
                     .map(title_case)
                     .unwrap_or_else(|| "My World".to_owned());
                 WorldRegistry {
+                    version: WORLD_REGISTRY_VERSION,
                     selected_id: "first-world".to_owned(),
                     worlds: vec![WorldEntry {
                         id: "first-world".to_owned(),
                         name,
                         save: initial_save,
                         created_unix_seconds: now(),
+                        format_version: save::CURRENT_FORMAT_VERSION,
+                        content_registry_version: save::CURRENT_CONTENT_REGISTRY_VERSION,
+                        worldgen_version: save::CURRENT_WORLDGEN_VERSION,
                     }],
                 }
             });
@@ -53,6 +67,18 @@ impl WorldManager {
             registry_path,
             data_dir,
         };
+        manager.registry.version = WORLD_REGISTRY_VERSION;
+        for world in &mut manager.registry.worlds {
+            if world.format_version == 0 {
+                world.format_version = save::CURRENT_FORMAT_VERSION;
+            }
+            if world.content_registry_version == 0 {
+                world.content_registry_version = save::CURRENT_CONTENT_REGISTRY_VERSION;
+            }
+            if world.worldgen_version == 0 {
+                world.worldgen_version = save::CURRENT_WORLDGEN_VERSION;
+            }
+        }
         if !manager
             .registry
             .worlds
@@ -129,6 +155,9 @@ impl WorldManager {
                 name: name.to_owned(),
                 save: save.clone(),
                 created_unix_seconds: now(),
+                format_version: save::CURRENT_FORMAT_VERSION,
+                content_registry_version: save::CURRENT_CONTENT_REGISTRY_VERSION,
+                worldgen_version: save::CURRENT_WORLDGEN_VERSION,
             })?,
         )
         .context("writing world metadata")?;
@@ -137,6 +166,9 @@ impl WorldManager {
             name: name.to_owned(),
             save,
             created_unix_seconds: now(),
+            format_version: save::CURRENT_FORMAT_VERSION,
+            content_registry_version: save::CURRENT_CONTENT_REGISTRY_VERSION,
+            worldgen_version: save::CURRENT_WORLDGEN_VERSION,
         });
         self.registry.selected_id = id.clone();
         self.save_registry()?;
@@ -224,6 +256,14 @@ mod tests {
                 .ends_with(PathBuf::from("worlds/fresh-world/world.save"))
         );
         assert_ne!(manager.worlds()[0].save, manager.worlds()[1].save);
+        assert_eq!(
+            manager.worlds()[1].format_version,
+            save::CURRENT_FORMAT_VERSION
+        );
+        assert_eq!(
+            manager.worlds()[1].content_registry_version,
+            save::CURRENT_CONTENT_REGISTRY_VERSION
+        );
 
         let reloaded = WorldManager::load(&dirs, PathBuf::from("ignored.save"));
         assert_eq!(reloaded.worlds().len(), 2);

@@ -71,6 +71,7 @@ async fn inner(
         clienthello_stream,
         &proto::ClientHello {
             name: (*cfg.name).into(),
+            protocol_version: proto::PROTOCOL_VERSION,
         },
     )
     .await?;
@@ -83,6 +84,13 @@ async fn inner(
     let hello = codec::recv::<proto::ServerHello>(&mut ordered)
         .await?
         .ok_or_else(|| anyhow!("ordered stream closed unexpectedly"))?;
+    if hello.protocol_version != proto::PROTOCOL_VERSION {
+        anyhow::bail!(
+            "server protocol {} is incompatible with client protocol {}",
+            hello.protocol_version,
+            proto::PROTOCOL_VERSION
+        );
+    }
     // Forward it on
     incoming.send(Message::Hello(hello)).unwrap();
 

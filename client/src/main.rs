@@ -61,7 +61,13 @@ fn main() {
                     .unwrap();
                 let _guard = runtime.enter();
                 server
-                    .connect(proto::ClientHello { name }, backend)
+                    .connect(
+                        proto::ClientHello {
+                            name,
+                            protocol_version: proto::PROTOCOL_VERSION,
+                        },
+                        backend,
+                    )
                     .unwrap();
                 runtime.block_on(server.run().instrument(error_span!("server")));
                 debug!("server thread terminated");

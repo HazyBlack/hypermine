@@ -14,6 +14,8 @@ use tokio::sync::mpsc;
 
 pub struct WorldgenDriver {
     work_queue: WorkQueue,
+    nearby_cache: traversal::NearbyCache,
+    scan_complete: bool,
     /// Voxel data that have been downloaded from the server for chunks not yet introduced to the graph
     preloaded_block_updates: FxHashMap<ChunkId, Vec<BlockUpdate>>,
     /// Voxel data that has been fetched from the server but not yet introduced to the graph
@@ -24,12 +26,20 @@ impl WorldgenDriver {
     pub fn new(chunk_load_parallelism: usize) -> Self {
         Self {
             work_queue: WorkQueue::new(chunk_load_parallelism),
+            nearby_cache: traversal::NearbyCache::default(),
+            scan_complete: false,
             preloaded_block_updates: FxHashMap::default(),
             preloaded_voxel_data: FxHashMap::default(),
         }
     }
 
-    pub fn drive(&mut self, view: Position, chunk_generation_distance: f32, graph: &mut Graph) {
+    pub fn drive(
+        &mut self,
+        view: Position,
+        chunk_generation_distance: f32,
+        traversal_padding: f32,
+        graph: &mut Graph,
+    ) {
         let drive_worldgen_started = Instant::now();
 
         // Check for chunks that have finished generating
@@ -44,10 +54,25 @@ impl WorldgenDriver {
         }
         let local_to_view = view.local.inverse();
 
-        traversal::ensure_nearby(graph, &view, chunk_generation_distance);
-        let nearby_nodes = traversal::nearby_nodes(graph, &view, chunk_generation_distance);
+        if self.nearby_cache.needs_refresh(
+            graph,
+            &view,
+            chunk_generation_distance,
+            traversal_padding,
+        ) {
+            traversal::ensure_nearby(graph, &view, chunk_generation_distance + traversal_padding);
+            self.nearby_cache
+                .refresh(graph, &view, chunk_generation_distance, traversal_padding);
+            self.scan_complete = false;
+        }
+        if self.scan_complete {
+            histogram!("frame.cpu.drive_worldgen").record(drive_worldgen_started.elapsed());
+            return;
+        }
+        let nearby_nodes = self.nearby_cache.shared_nodes();
 
-        'nearby_nodes: for &(node, ref node_transform) in &nearby_nodes {
+        let mut completed_scan = true;
+        'nearby_nodes: for &(node, ref node_transform) in nearby_nodes.iter() {
             let node_to_view = local_to_view * node_transform;
             for vertex in Vertex::iter() {
                 let chunk_id = ChunkId::new(node, vertex);
@@ -72,10 +97,12 @@ impl WorldgenDriver {
                     graph[chunk_id] = Chunk::Generating;
                 } else {
                     // No capacity is available in the work queue. Stop trying to prepare chunks to generate.
+                    completed_scan = false;
                     break 'nearby_nodes;
                 }
             }
         }
+        self.scan_complete = completed_scan;
         histogram!("frame.cpu.drive_worldgen").record(drive_worldgen_started.elapsed());
     }
 

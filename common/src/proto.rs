@@ -5,15 +5,20 @@ use crate::{
     voxel_math::Coords, world::Material,
 };
 
+pub const PROTOCOL_VERSION: u32 = 1;
+
 #[derive(Debug, Serialize, Deserialize)]
 pub struct ClientHello {
     pub name: String,
+    #[serde(default)]
+    pub protocol_version: u32,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
 pub struct ServerHello {
     pub character: EntityId,
     pub sim_config: SimConfig,
+    pub protocol_version: u32,
 }
 
 #[derive(Debug, Serialize, Deserialize, Copy, Clone)]
@@ -127,4 +132,51 @@ pub mod connection_error_codes {
     pub const BAD_CLIENT_COMMAND: VarInt = VarInt::from_u32(2);
     pub const NAME_CONFLICT: VarInt = VarInt::from_u32(3);
     pub const CLIENT_CLOSED_CONNECTION: VarInt = VarInt::from_u32(4);
+    pub const INCOMPATIBLE_PROTOCOL: VarInt = VarInt::from_u32(5);
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::{
+        dodeca::Vertex, graph::NodeId, node::ChunkId, voxel_math::Coords, world::Material,
+    };
+
+    use super::{BlockEditBatch, VoxelEdit};
+
+    #[test]
+    fn block_edit_batches_have_a_hard_safety_budget() {
+        let mut batch = BlockEditBatch::default();
+        assert!(batch.is_within_budget());
+        batch.edits = vec![
+            VoxelEdit {
+                chunk_id: ChunkId::new(NodeId::ROOT, Vertex::A),
+                coords: Coords([0, 0, 0]),
+                new_material: Material::Dirt,
+            };
+            BlockEditBatch::MAX_EDITS + 1
+        ];
+        assert!(!batch.is_within_budget());
+    }
+}
+
+/// A permanent voxel change without inventory-side effects. Geometry tools can collect these into
+/// one validated operation instead of issuing thousands of independent gameplay requests.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct VoxelEdit {
+    pub chunk_id: ChunkId,
+    pub coords: Coords,
+    pub new_material: Material,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct BlockEditBatch {
+    pub edits: Vec<VoxelEdit>,
+}
+
+impl BlockEditBatch {
+    pub const MAX_EDITS: usize = 65_536;
+
+    pub fn is_within_budget(&self) -> bool {
+        self.edits.len() <= Self::MAX_EDITS
+    }
 }

@@ -1127,17 +1127,7 @@ fn inventory_panel(title: &str, children: impl FnOnce()) {
 }
 
 fn material_name(material: Material) -> String {
-    let raw = format!("{material:?}");
-    let mut result = String::with_capacity(raw.len() + 4);
-    let mut previous_was_lowercase = false;
-    for character in raw.chars() {
-        if character.is_uppercase() && previous_was_lowercase {
-            result.push(' ');
-        }
-        previous_was_lowercase = character.is_lowercase();
-        result.push(character);
-    }
-    result
+    material.definition().display_name.to_owned()
 }
 
 #[allow(dead_code)]

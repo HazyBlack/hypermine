@@ -1,4 +1,4 @@
-use std::{fs, fs::File, io::BufReader, path::Path};
+use std::{fs::File, io::BufReader, path::Path};
 
 use common::world::Material;
 use tracing::warn;
@@ -21,25 +21,18 @@ impl MaterialIcons {
             warn!("material icon directory was not found");
             return Self { textures };
         };
-        let Ok(entries) = fs::read_dir(directory) else {
-            warn!("material icon directory could not be read");
-            return Self { textures };
-        };
-        let mut paths = entries
-            .filter_map(Result::ok)
-            .map(|entry| entry.path())
-            .filter(|path| path.extension().is_some_and(|extension| extension == "png"))
-            .collect::<Vec<_>>();
-        paths.sort();
-
-        for (index, path) in paths.into_iter().take(Material::COUNT - 1).enumerate() {
+        for definition in Material::DEFINITIONS.iter().skip(1) {
+            let Some(texture_file) = definition.texture_file else {
+                continue;
+            };
+            let path = directory.join(texture_file);
             match load_rgba(&path) {
                 Ok((width, height, pixels)) => {
                     let mut texture =
                         Texture::new(TextureFormat::Rgba8Srgb, (width, height).into(), pixels);
                     texture.min_filter = TextureFilter::Nearest;
                     texture.mag_filter = TextureFilter::Nearest;
-                    textures[index + 1] = Some(yak.add_texture(texture));
+                    textures[definition.material as usize] = Some(yak.add_texture(texture));
                 }
                 Err(error) => warn!(?path, %error, "couldn't load material icon"),
             }
@@ -78,4 +71,27 @@ fn load_rgba(path: &Path) -> anyhow::Result<(u32, u32, Vec<u8>)> {
         png::ColorType::Indexed => anyhow::bail!("indexed PNG was not expanded"),
     };
     Ok((info.width, info.height, pixels))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn every_registered_material_texture_exists() {
+        let assets = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .unwrap()
+            .join("assets/materials");
+        for definition in Material::DEFINITIONS.iter().skip(1) {
+            let texture = definition
+                .texture_file
+                .expect("non-empty material has a texture");
+            assert!(
+                assets.join(texture).is_file(),
+                "missing texture for {}: {texture}",
+                definition.key
+            );
+        }
+    }
 }

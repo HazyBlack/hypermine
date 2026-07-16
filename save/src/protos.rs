@@ -4,6 +4,15 @@ pub struct Meta {
     /// Number of voxels along the edge of a chunk
     #[prost(uint32, tag = "1")]
     pub chunk_size: u32,
+    /// Save container and component schema version. Zero identifies legacy saves.
+    #[prost(uint32, tag = "2")]
+    pub format_version: u32,
+    /// Version of the stable material/content registry used by this world.
+    #[prost(uint32, tag = "3")]
+    pub content_registry_version: u32,
+    /// Version of procedural generation rules used when creating new terrain.
+    #[prost(uint32, tag = "4")]
+    pub worldgen_version: u32,
 }
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct Character {

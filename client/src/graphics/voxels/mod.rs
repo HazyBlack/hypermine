@@ -105,10 +105,15 @@ impl Voxels {
         let node_scan_started = Instant::now();
         let frustum_planes = frustum.planes();
         let local_to_view = view.local.inverse();
+        let max_node_cosh_distance =
+            (sim.cfg.view_distance + dodeca::BOUNDING_SPHERE_RADIUS).cosh();
         let mut extractions = Vec::new();
         for &(node, ref node_transform) in nearby_nodes {
             let node_to_view = local_to_view * node_transform;
             let origin = node_to_view * MPoint::origin();
+            if origin.w > max_node_cosh_distance {
+                continue;
+            }
             if !frustum_planes.contain(&origin, dodeca::BOUNDING_SPHERE_RADIUS) {
                 // Don't bother generating or drawing chunks from nodes that are wholly outside the
                 // frustum.

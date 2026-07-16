@@ -356,6 +356,7 @@ impl Sim {
         self.worldgen_driver.drive(
             self.view(),
             self.cfg.chunk_generation_distance,
+            5.0 * self.cfg.meters_to_absolute,
             &mut self.graph,
         );
 
