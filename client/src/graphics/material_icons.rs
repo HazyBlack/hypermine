@@ -7,11 +7,15 @@ use yakui::{
     paint::{Texture, TextureFilter, TextureFormat},
 };
 
-use crate::Config;
+use crate::{
+    Config,
+    inventory::{ItemStack, Tool},
+};
 
 #[derive(Clone)]
 pub struct MaterialIcons {
     textures: [Option<ManagedTextureId>; Material::COUNT],
+    admin_pick: Option<ManagedTextureId>,
 }
 
 impl MaterialIcons {
@@ -19,7 +23,10 @@ impl MaterialIcons {
         let mut textures = [None; Material::COUNT];
         let Some(directory) = config.find_asset(Path::new("materials")) else {
             warn!("material icon directory was not found");
-            return Self { textures };
+            return Self {
+                textures,
+                admin_pick: None,
+            };
         };
         for definition in Material::DEFINITIONS.iter().skip(1) {
             let Some(texture_file) = definition.texture_file else {
@@ -37,11 +44,40 @@ impl MaterialIcons {
                 Err(error) => warn!(?path, %error, "couldn't load material icon"),
             }
         }
-        Self { textures }
+        let admin_pick = config
+            .find_asset(Path::new("items/00040_admin_pick.png"))
+            .and_then(|path| match load_rgba(&path) {
+                Ok((width, height, pixels)) => {
+                    let mut texture =
+                        Texture::new(TextureFormat::Rgba8Srgb, (width, height).into(), pixels);
+                    texture.min_filter = TextureFilter::Linear;
+                    texture.mag_filter = TextureFilter::Linear;
+                    Some(yak.add_texture(texture))
+                }
+                Err(error) => {
+                    warn!(?path, %error, "couldn't load Admin Pick icon");
+                    None
+                }
+            });
+        Self {
+            textures,
+            admin_pick,
+        }
     }
 
     pub fn get(&self, material: Material) -> Option<ManagedTextureId> {
         self.textures[material as usize]
+    }
+
+    pub fn get_stack(&self, stack: ItemStack) -> Option<ManagedTextureId> {
+        if let Some(material) = stack.material {
+            self.get(material)
+        } else {
+            match stack.tool {
+                Some(Tool::AdminPick) => self.admin_pick,
+                None => None,
+            }
+        }
     }
 }
 
@@ -93,5 +129,14 @@ mod tests {
                 definition.key
             );
         }
+    }
+
+    #[test]
+    fn admin_pick_icon_exists() {
+        let asset = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .unwrap()
+            .join("assets/items/00040_admin_pick.png");
+        assert!(asset.is_file(), "missing Admin Pick icon");
     }
 }

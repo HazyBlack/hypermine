@@ -11,8 +11,8 @@ use common::world::Material;
 
 use crate::{
     Action, SettingsStore, Sim, WorldManager,
-    inventory::{HOTBAR_SLOTS, ItemStack, STACK_LIMIT},
-    settings::{UserSettings, display_key},
+    inventory::{HOTBAR_SLOTS, ItemStack, STACK_LIMIT, Tool},
+    settings::{AdminPickSettings, UserSettings, display_key},
 };
 
 use super::material_icons::MaterialIcons;
@@ -185,7 +185,11 @@ impl GuiState {
         let unlimited = !sim.cfg.gameplay_enabled || layout.creative_tab;
         layout.reconcile(&counts, unlimited, self.held_stack);
         sim.set_creative_mode(layout.creative_tab);
-        sim.set_selected_material(layout.selected_stack().material.unwrap_or(Material::Void));
+        let selected = layout.selected_stack();
+        sim.set_selected_material(selected.material.unwrap_or(Material::Void));
+        sim.set_admin_pick_selected(selected.tool == Some(Tool::AdminPick));
+        let pick = settings.value.admin_pick;
+        sim.set_admin_pick_dimensions(pick.width, pick.height, pick.depth);
     }
 
     pub fn toggle_hud(&mut self) {
@@ -259,7 +263,16 @@ impl GuiState {
                 sim.geometry_preview_enabled()
                     .then(|| sim.looking_at().is_some())
             });
-            self.hud(&layout, unlimited, preview);
+            let admin_pick = sim.as_deref().and_then(|sim| {
+                sim.admin_pick_selected().then(|| {
+                    (
+                        sim.admin_pick_dimensions(),
+                        sim.admin_pick_block_count(),
+                        sim.admin_dig_remaining(),
+                    )
+                })
+            });
+            self.hud(&layout, unlimited, preview, admin_pick);
         }
         if !self.menu_open()
             && let Some(sim) = sim.as_deref()
@@ -325,6 +338,7 @@ impl GuiState {
         layout: &crate::inventory::InventoryLayout,
         unlimited: bool,
         geometry_preview: Option<bool>,
+        admin_pick: Option<([u16; 3], u64, Option<u64>)>,
     ) {
         align(Alignment::CENTER, || {
             colored_box(Color::WHITE.with_alpha(0.9), [3.0, 15.0]);
@@ -340,6 +354,29 @@ impl GuiState {
                 list.cross_axis_alignment = CrossAxisAlignment::Center;
                 list.main_axis_size = MainAxisSize::Min;
                 list.show(|| {
+                    if let Some(([width, height, depth], count, remaining)) = admin_pick {
+                        colored_box_container(Color::BLACK.with_alpha(0.78), || {
+                            pad(Pad::balanced(10.0, 4.0), || {
+                                let previewed = count.min(512);
+                                label(format!(
+                                    "Admin Pick - {width} x {height} x {depth} - {count} blocks{}",
+                                    if remaining.is_some() { " - DIGGING" } else { "" }
+                                ));
+                                if let Some(remaining) = remaining {
+                                    label(format!(
+                                        "{remaining} blocks remaining - right-click to cancel"
+                                    ));
+                                }
+                                label(if count <= 512 {
+                                    "All affected blocks highlighted - left-click dig - right-click cancel".to_owned()
+                                } else {
+                                    format!(
+                                        "Nearest {previewed} affected blocks highlighted - left-click queue - right-click cancel"
+                                    )
+                                });
+                            });
+                        });
+                    }
                     if let Some(has_target) = geometry_preview {
                         colored_box_container(Color::BLACK.with_alpha(0.72), || {
                             pad(Pad::balanced(10.0, 4.0), || {
@@ -351,10 +388,11 @@ impl GuiState {
                             });
                         });
                     }
-                    if let Some(material) = layout.selected_stack().material {
+                    let selected = layout.selected_stack();
+                    if let Some(name) = item_name(selected) {
                         colored_box_container(Color::BLACK.with_alpha(0.72), || {
                             pad(Pad::balanced(10.0, 4.0), || {
-                                label(material_name(material));
+                                label(name);
                             });
                         });
                     }
@@ -574,6 +612,7 @@ impl GuiState {
         next: &mut Option<MenuScreen>,
     ) {
         let mut layout = settings.value.inventory.layout(world_id);
+        let mut admin_pick = settings.value.admin_pick;
         let counts = sim
             .as_deref()
             .map(Sim::inventory_material_counts)
@@ -585,7 +624,7 @@ impl GuiState {
 
         let icons = self.icons.clone();
         let mut held = self.held_stack;
-        let mut hovered = None;
+        let mut hovered = None::<String>;
         let mut changed = false;
         let mut close = false;
         let mut return_to_spawn = false;
@@ -627,7 +666,7 @@ impl GuiState {
                             .unwrap_or(ItemStack::EMPTY);
                         let response = item_slot(&icons, stack, false, slot_size, None, true);
                         if response.hovering {
-                            hovered = material;
+                            hovered = material.map(material_name);
                         }
                         if response.clicked
                             && let Some(material) = material
@@ -636,6 +675,27 @@ impl GuiState {
                             changed = true;
                         }
                     });
+                    label("Admin Tools");
+                    let admin_pick_stack = ItemStack::tool(Tool::AdminPick);
+                    let response =
+                        item_slot(&icons, admin_pick_stack, false, slot_size, None, true);
+                    if response.hovering {
+                        hovered = Some(Tool::AdminPick.display_name().to_owned());
+                    }
+                    if response.clicked {
+                        held = Some(admin_pick_stack);
+                        changed = true;
+                    }
+                    label(format!(
+                        "Admin Pick: {} x {} x {} = {} blocks",
+                        admin_pick.width,
+                        admin_pick.height,
+                        admin_pick.depth,
+                        admin_pick.block_count()
+                    ));
+                    dimension_controls("Width", &mut admin_pick.width, &mut changed);
+                    dimension_controls("Height", &mut admin_pick.height, &mut changed);
+                    dimension_controls("Depth", &mut admin_pick.depth, &mut changed);
                     if menu_button("Return to Spawn") {
                         return_to_spawn = true;
                         close = true;
@@ -647,7 +707,7 @@ impl GuiState {
                         let stack = layout.slots[index];
                         let response = item_slot(&icons, stack, false, slot_size, None, false);
                         if response.hovering {
-                            hovered = stack.material;
+                            hovered = item_name(stack);
                         }
                         if response.clicked {
                             layout.left_click_slot(index, &mut held, false);
@@ -668,7 +728,7 @@ impl GuiState {
                         unlimited,
                     );
                     if response.hovering {
-                        hovered = stack.material;
+                        hovered = item_name(stack);
                     }
                     if response.clicked {
                         if held.is_none() {
@@ -681,9 +741,7 @@ impl GuiState {
                 });
 
                 label(
-                    hovered
-                        .map(material_name)
-                        .unwrap_or_else(|| "Move stacks with the left mouse button".to_owned()),
+                    hovered.unwrap_or_else(|| "Move stacks with the left mouse button".to_owned()),
                 );
                 if menu_button("Done") {
                     close = true;
@@ -692,7 +750,7 @@ impl GuiState {
         );
 
         self.held_stack = held;
-        self.hovered_material = hovered;
+        self.hovered_material = None;
         if close {
             layout.return_held(&mut self.held_stack, unlimited);
             *next = Some(MenuScreen::Closed);
@@ -700,7 +758,10 @@ impl GuiState {
         }
         if let Some(sim) = sim {
             sim.set_creative_mode(layout.creative_tab);
-            sim.set_selected_material(layout.selected_stack().material.unwrap_or(Material::Void));
+            let selected = layout.selected_stack();
+            sim.set_selected_material(selected.material.unwrap_or(Material::Void));
+            sim.set_admin_pick_selected(selected.tool == Some(Tool::AdminPick));
+            sim.set_admin_pick_dimensions(admin_pick.width, admin_pick.height, admin_pick.depth);
             if return_to_spawn {
                 sim.request_return_to_spawn();
             }
@@ -710,6 +771,7 @@ impl GuiState {
             .inventory
             .worlds
             .insert(world_id.to_owned(), layout);
+        settings.value.admin_pick = admin_pick;
         if changed {
             settings.save();
         }
@@ -717,9 +779,6 @@ impl GuiState {
 
     fn draw_held_stack(&self, ui_scale: f32) {
         let Some(held_stack) = self.held_stack.filter(|stack| !stack.is_empty()) else {
-            return;
-        };
-        let Some(material) = held_stack.material else {
             return;
         };
         let position = [
@@ -730,7 +789,7 @@ impl GuiState {
             offset(position.into(), || {
                 stack(|| {
                     colored_box(Color::BLACK.with_alpha(0.72), [40.0, 40.0]);
-                    if let Some(icon) = self.icons.get(material) {
+                    if let Some(icon) = self.icons.get_stack(held_stack) {
                         align(Alignment::CENTER, || {
                             image(icon, [32.0, 32.0]);
                         });
@@ -1046,6 +1105,27 @@ fn toggle_row(label_text: &str, value: &mut bool, changed: &mut bool) {
     }
 }
 
+fn dimension_controls(label_text: &str, value: &mut u16, changed: &mut bool) {
+    row(|| {
+        label(format!("{label_text}: {value}"));
+        for (text, delta) in [
+            ("-100", -100),
+            ("-10", -10),
+            ("-1", -1),
+            ("+1", 1),
+            ("+10", 10),
+            ("+100", 100),
+        ] {
+            if menu_button(text) {
+                *value = (i32::from(*value) + delta)
+                    .clamp(1, i32::from(AdminPickSettings::MAX_AXIS))
+                    as u16;
+                *changed = true;
+            }
+        }
+    });
+}
+
 #[derive(Default)]
 struct SlotResponse {
     clicked: bool,
@@ -1082,9 +1162,7 @@ fn item_slot(
                 result.clicked = response.clicked;
                 result.hovering = response.hovering;
 
-                if let Some(material) = item_stack.material
-                    && let Some(icon) = icons.get(material)
-                {
+                if let Some(icon) = icons.get_stack(item_stack) {
                     align(Alignment::CENTER, || {
                         image(icon, [size * 0.68, size * 0.68]);
                     });
@@ -1168,6 +1246,13 @@ fn inventory_panel(title: &str, children: impl FnOnce()) {
 
 fn material_name(material: Material) -> String {
     material.definition().display_name.to_owned()
+}
+
+fn item_name(stack: ItemStack) -> Option<String> {
+    stack
+        .material
+        .map(material_name)
+        .or_else(|| stack.tool.map(|tool| tool.display_name().to_owned()))
 }
 
 #[allow(dead_code)]

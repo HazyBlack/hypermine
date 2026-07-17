@@ -13,6 +13,7 @@ pub struct UserSettings {
     pub video: VideoSettings,
     pub controls: ControlSettings,
     pub inventory: InventorySettings,
+    pub admin_pick: AdminPickSettings,
 }
 
 impl UserSettings {
@@ -59,6 +60,35 @@ impl UserSettings {
             3.0,
             defaults.controls.mouse_sensitivity,
         );
+        self.admin_pick.width = self.admin_pick.width.clamp(1, AdminPickSettings::MAX_AXIS);
+        self.admin_pick.height = self.admin_pick.height.clamp(1, AdminPickSettings::MAX_AXIS);
+        self.admin_pick.depth = self.admin_pick.depth.clamp(1, AdminPickSettings::MAX_AXIS);
+    }
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+#[serde(default)]
+pub struct AdminPickSettings {
+    pub width: u16,
+    pub height: u16,
+    pub depth: u16,
+}
+
+impl AdminPickSettings {
+    pub const MAX_AXIS: u16 = 1_000;
+
+    pub fn block_count(self) -> u64 {
+        u64::from(self.width) * u64::from(self.height) * u64::from(self.depth)
+    }
+}
+
+impl Default for AdminPickSettings {
+    fn default() -> Self {
+        Self {
+            width: 1,
+            height: 1,
+            depth: 1,
+        }
     }
 }
 

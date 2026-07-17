@@ -122,6 +122,8 @@ mod tests {
             creative: false,
             return_to_spawn: false,
             block_update: None,
+            admin_dig: None,
+            cancel_admin_dig: false,
         };
 
         let mut pred = PredictedMotion::new(pos());

@@ -20,6 +20,8 @@ use common::{
         Inventory, Position,
     },
     sanitize_motion_input,
+    voxel_cursor::VoxelCursor,
+    voxel_math::{CoordSign, Coords},
     world::Material,
 };
 
@@ -53,6 +55,12 @@ pub struct HomeGuidance {
     pub target_in_view: Option<[f32; 3]>,
 }
 
+#[derive(Debug, Clone, Copy)]
+pub struct AdminPickPreviewVoxel {
+    pub chunk_to_view: na::Matrix4<f32>,
+    pub coords: Coords,
+}
+
 /// Game state
 pub struct Sim {
     // World state
@@ -80,6 +88,10 @@ pub struct Sim {
     average_movement_input: na::Vector3<f32>,
     no_clip: bool,
     creative_mode: bool,
+    admin_pick_selected: bool,
+    admin_pick_dimensions: [u16; 3],
+    admin_dig_active: bool,
+    admin_dig_remaining: Option<u64>,
     geometry_preview: bool,
     return_to_spawn_requested: bool,
     /// Whether no_clip will be toggled next step
@@ -125,6 +137,10 @@ impl Sim {
             average_movement_input: na::zero(),
             no_clip: true,
             creative_mode: true,
+            admin_pick_selected: false,
+            admin_pick_dimensions: [1, 1, 1],
+            admin_dig_active: false,
+            admin_dig_remaining: None,
             geometry_preview: false,
             return_to_spawn_requested: false,
             toggle_no_clip: false,
@@ -231,6 +247,107 @@ impl Sim {
 
     pub fn creative_mode(&self) -> bool {
         self.creative_mode
+    }
+
+    pub fn set_admin_pick_selected(&mut self, selected: bool) {
+        self.admin_pick_selected = selected;
+    }
+
+    pub fn admin_pick_selected(&self) -> bool {
+        self.admin_pick_selected && (!self.cfg.gameplay_enabled || self.creative_mode)
+    }
+
+    pub fn set_admin_pick_dimensions(&mut self, width: u16, height: u16, depth: u16) {
+        self.admin_pick_dimensions = [width, height, depth];
+    }
+
+    pub fn admin_pick_dimensions(&self) -> [u16; 3] {
+        self.admin_pick_dimensions
+    }
+
+    pub fn admin_pick_block_count(&self) -> u64 {
+        self.admin_pick_dimensions
+            .into_iter()
+            .map(u64::from)
+            .product()
+    }
+
+    pub fn admin_dig_active(&self) -> bool {
+        self.admin_dig_active
+    }
+
+    pub fn admin_dig_remaining(&self) -> Option<u64> {
+        self.admin_dig_remaining
+    }
+
+    /// Builds the visible, near-first portion of the Admin Pick selection. Large volumes are
+    /// intentionally capped for frame-time safety; the HUD still reports the full operation size.
+    pub fn admin_pick_preview(&self, limit: usize) -> Vec<AdminPickPreviewVoxel> {
+        if !self.admin_pick_selected() || limit == 0 {
+            return Vec::new();
+        }
+        let Some(hit) = self.looking_at() else {
+            return Vec::new();
+        };
+        let dimensions = self.admin_pick_dimensions;
+        let origin = PreviewCursor {
+            voxel: VoxelCursor::from_hit(hit.chunk, hit.voxel_coords, hit.face_axis, hit.face_sign),
+            chunk_to_view: hit.chunk_to_view,
+        };
+        let mut plane_origin = origin;
+        let mut row_origin = origin;
+        let mut cursor = origin;
+        let mut indices = [0u16; 3];
+        let total = self.admin_pick_block_count().min(limit as u64) as usize;
+        let mut result = Vec::with_capacity(total);
+        while result.len() < total {
+            result.push(AdminPickPreviewVoxel {
+                chunk_to_view: cursor.chunk_to_view,
+                coords: cursor.voxel.coords,
+            });
+            indices[0] += 1;
+            if indices[0] < dimensions[0] {
+                let Some(next) = step_preview_offset(
+                    &self.graph,
+                    cursor,
+                    0,
+                    centered_offset(indices[0] - 1),
+                    centered_offset(indices[0]),
+                ) else {
+                    break;
+                };
+                cursor = next;
+                continue;
+            }
+            indices[0] = 0;
+            indices[1] += 1;
+            if indices[1] < dimensions[1] {
+                let Some(next) = step_preview_offset(
+                    &self.graph,
+                    row_origin,
+                    1,
+                    centered_offset(indices[1] - 1),
+                    centered_offset(indices[1]),
+                ) else {
+                    break;
+                };
+                row_origin = next;
+                cursor = row_origin;
+                continue;
+            }
+            indices[1] = 0;
+            indices[2] += 1;
+            if indices[2] >= dimensions[2] {
+                break;
+            }
+            let Some(next) = step_preview_offset(&self.graph, plane_origin, 2, 0, 1) else {
+                break;
+            };
+            plane_origin = next;
+            row_origin = plane_origin;
+            cursor = plane_origin;
+        }
+        result
     }
 
     pub fn toggle_geometry_preview(&mut self) {
@@ -442,6 +559,11 @@ impl Sim {
                 for &(id, ref new_state) in &msg.character_states {
                     self.update_character_state(id, new_state);
                 }
+                self.admin_dig_remaining =
+                    msg.admin_dig_remaining.iter().find_map(|&(id, remaining)| {
+                        (id == self.local_character_id).then_some(remaining)
+                    });
+                self.admin_dig_active = self.admin_dig_remaining.is_some();
                 self.reconcile_prediction(msg.latest_input);
             }
         }
@@ -606,6 +728,16 @@ impl Sim {
         } else {
             self.local_character_controller.horizontal_orientation()
         };
+        let admin_dig = self.get_admin_dig_request();
+        if admin_dig.is_some() {
+            self.admin_dig_active = true;
+            self.admin_dig_remaining = admin_dig.map(proto::AdminDigRequest::block_count);
+        }
+        let cancel_admin_dig = self.admin_pick_selected() && self.place_block_pressed;
+        if cancel_admin_dig {
+            self.admin_dig_active = false;
+            self.admin_dig_remaining = None;
+        }
         let character_input = CharacterInput {
             movement: sanitize_motion_input(orientation * self.average_movement_input),
             jump: self.is_jumping,
@@ -613,6 +745,8 @@ impl Sim {
             creative: self.creative_mode,
             return_to_spawn: self.return_to_spawn_requested,
             block_update: self.get_local_character_block_update(),
+            admin_dig,
+            cancel_admin_dig,
         };
         let generation = self
             .prediction
@@ -649,6 +783,8 @@ impl Sim {
             creative: self.creative_mode,
             return_to_spawn: false,
             block_update: None,
+            admin_dig: None,
+            cancel_admin_dig: false,
         };
         character_controller::run_character_step(
             &self.cfg,
@@ -702,6 +838,9 @@ impl Sim {
 
     /// Provides the logic for the player to be able to place and break blocks at will
     fn get_local_character_block_update(&self) -> Option<BlockUpdate> {
+        if self.admin_pick_selected() {
+            return None;
+        }
         let placing = if self.place_block_pressed {
             true
         } else if self.break_block_pressed {
@@ -745,4 +884,84 @@ impl Sim {
             consumed_entity,
         })
     }
+
+    fn get_admin_dig_request(&self) -> Option<proto::AdminDigRequest> {
+        if !self.admin_pick_selected() || !self.break_block_pressed {
+            return None;
+        }
+        let hit = self.looking_at()?;
+        let [width, height, depth] = self.admin_pick_dimensions;
+        let request = proto::AdminDigRequest {
+            chunk_id: hit.chunk,
+            coords: hit.voxel_coords,
+            face_axis: hit.face_axis,
+            face_sign: hit.face_sign,
+            width,
+            height,
+            depth,
+        };
+        request.is_valid().then_some(request)
+    }
+}
+
+#[derive(Clone, Copy)]
+struct PreviewCursor {
+    voxel: VoxelCursor,
+    chunk_to_view: na::Matrix4<f32>,
+}
+
+fn centered_offset(index: u16) -> i32 {
+    if index == 0 {
+        0
+    } else if index % 2 == 1 {
+        i32::from(index.div_ceil(2))
+    } else {
+        -i32::from(index / 2)
+    }
+}
+
+fn step_preview_offset(
+    graph: &Graph,
+    mut cursor: PreviewCursor,
+    axis: usize,
+    from: i32,
+    to: i32,
+) -> Option<PreviewCursor> {
+    let delta = to - from;
+    let sign = if delta >= 0 {
+        CoordSign::Plus
+    } else {
+        CoordSign::Minus
+    };
+    for _ in 0..delta.unsigned_abs() {
+        cursor = step_preview(graph, cursor, axis, sign)?;
+    }
+    Some(cursor)
+}
+
+fn step_preview(
+    graph: &Graph,
+    cursor: PreviewCursor,
+    axis: usize,
+    sign: CoordSign,
+) -> Option<PreviewCursor> {
+    let direction = cursor.voxel.local_direction(axis, sign);
+    let next = cursor.voxel.step(graph, axis, sign)?;
+    let chunk_to_view = if next.chunk == cursor.voxel.chunk {
+        cursor.chunk_to_view
+    } else {
+        let old_chunk_to_node = cursor.voxel.chunk.vertex.chunk_to_node();
+        let node_to_view = cursor.chunk_to_view * old_chunk_to_node.try_inverse().unwrap();
+        let next_node_to_old_node = if next.chunk.node == cursor.voxel.chunk.node {
+            na::Matrix4::identity()
+        } else {
+            let side = cursor.voxel.chunk.vertex.canonical_sides()[direction.axis as usize];
+            na::Matrix4::from(*side.reflection())
+        };
+        node_to_view * next_node_to_old_node * next.chunk.vertex.chunk_to_node()
+    };
+    Some(PreviewCursor {
+        voxel: next,
+        chunk_to_view,
+    })
 }

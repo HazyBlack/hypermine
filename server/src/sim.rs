@@ -4,7 +4,9 @@ use anyhow::Context;
 use common::dodeca::{Side, Vertex};
 use common::math::MIsometry;
 use common::node::VoxelData;
-use common::proto::{BlockUpdate, Inventory, SerializedVoxelData};
+use common::proto::{AdminDigRequest, BlockUpdate, Inventory, SerializedVoxelData};
+use common::voxel_cursor::VoxelCursor;
+use common::voxel_math::CoordSign;
 use common::world::Material;
 use common::{GraphEntities, node::ChunkId};
 use fxhash::{FxHashMap, FxHashSet};
@@ -47,6 +49,7 @@ pub struct Sim {
     /// All chunks in the graph have ever had any block updates applied to them and can no longer be regenerated with worldgen.
     /// This doesn't include chunks that have not been added to the graph yet (See `preloaded_voxel_data`).
     modified_chunks: FxHashSet<ChunkId>,
+    admin_digs: FxHashMap<EntityId, AdminDigJob>,
 }
 
 impl Sim {
@@ -63,6 +66,7 @@ impl Sim {
             dirty_nodes: FxHashSet::default(),
             dirty_voxel_nodes: FxHashSet::default(),
             modified_chunks: FxHashSet::default(),
+            admin_digs: FxHashMap::default(),
             cfg,
         };
 
@@ -530,6 +534,7 @@ impl Sim {
         }
 
         let mut pending_block_updates: Vec<(Entity, BlockUpdate, bool)> = vec![];
+        let mut pending_admin_digs = Vec::new();
 
         // Simulate
         for (entity, node, position, character, input) in self
@@ -559,6 +564,15 @@ impl Sim {
             if let Some(block_update) = input.block_update.clone() {
                 pending_block_updates.push((entity, block_update, input.creative));
             }
+            if !input.creative || input.cancel_admin_dig || input.admin_dig.is_some() {
+                let id = *self.world.get::<&EntityId>(entity).unwrap();
+                pending_admin_digs.push((
+                    id,
+                    input.admin_dig,
+                    input.cancel_admin_dig,
+                    input.creative,
+                ));
+            }
             self.dirty_nodes.insert(*node);
         }
 
@@ -566,6 +580,21 @@ impl Sim {
             let id = *self.world.get::<&EntityId>(entity).unwrap();
             self.attempt_block_update(id, block_update, creative);
         }
+
+        for (id, request, cancel, creative) in pending_admin_digs {
+            if cancel || !creative {
+                self.admin_digs.remove(&id);
+            }
+            if creative && let Some(request) = request.filter(|request| request.is_valid()) {
+                let job = AdminDigJob::new(&mut self.graph, request);
+                self.admin_digs.insert(id, job);
+            }
+        }
+        for input in self.world.query::<&mut CharacterInput>().iter() {
+            input.admin_dig = None;
+            input.cancel_admin_dig = false;
+        }
+        self.process_admin_digs();
 
         self.update_entity_node_ids();
 
@@ -590,6 +619,11 @@ impl Sim {
                 .query::<(&EntityId, &Character)>()
                 .iter()
                 .map(|(&id, ch)| (id, ch.state.clone()))
+                .collect(),
+            admin_dig_remaining: self
+                .admin_digs
+                .iter()
+                .map(|(&id, job)| (id, job.remaining()))
                 .collect(),
         };
 
@@ -735,6 +769,48 @@ impl Sim {
         self.dirty_voxel_nodes.insert(block_update.chunk_id.node);
         self.accumulated_changes.block_updates.push(block_update);
     }
+
+    fn process_admin_digs(&mut self) {
+        const EDITS_PER_PLAYER_PER_STEP: usize = 1_024;
+        let ids = self.admin_digs.keys().copied().collect::<Vec<_>>();
+        for id in ids {
+            let Some(mut job) = self.admin_digs.remove(&id) else {
+                continue;
+            };
+            for _ in 0..EDITS_PER_PLAYER_PER_STEP {
+                let Some(cursor) = job.next(&mut self.graph) else {
+                    break;
+                };
+                let chunk = cursor.chunk;
+                if matches!(self.graph[chunk], Chunk::Fresh) {
+                    if let Some(voxel_data) = self.preloaded_voxel_data.remove(&chunk) {
+                        self.modified_chunks.insert(chunk);
+                        self.graph.populate_chunk(chunk, voxel_data);
+                    } else {
+                        let params = ChunkParams::new(&mut self.graph, chunk);
+                        self.graph.populate_chunk(chunk, params.generate_voxels());
+                    }
+                }
+                if self.graph.get_material(chunk, cursor.coords) == Some(Material::Void) {
+                    continue;
+                }
+                let update = BlockUpdate {
+                    chunk_id: chunk,
+                    coords: cursor.coords,
+                    new_material: Material::Void,
+                    consumed_entity: None,
+                };
+                if self.graph.update_block(&update) {
+                    self.modified_chunks.insert(chunk);
+                    self.dirty_voxel_nodes.insert(chunk.node);
+                    self.accumulated_changes.block_updates.push(update);
+                }
+            }
+            if !job.finished() {
+                self.admin_digs.insert(id, job);
+            }
+        }
+    }
 }
 
 fn character_spawn_position() -> Position {
@@ -742,6 +818,118 @@ fn character_spawn_position() -> Position {
         node: NodeId::ROOT,
         local: MIsometry::translation_along(&(na::Vector3::y() * 1.4)),
     }
+}
+
+struct AdminDigJob {
+    dimensions: [u16; 3],
+    plane_origin: VoxelCursor,
+    row_origin: VoxelCursor,
+    cursor: VoxelCursor,
+    indices: [u16; 3],
+    done: bool,
+    processed: u64,
+    total: u64,
+}
+
+impl AdminDigJob {
+    fn new(graph: &mut Graph, request: AdminDigRequest) -> Self {
+        let origin = VoxelCursor::from_hit(
+            request.chunk_id,
+            request.coords,
+            request.face_axis,
+            request.face_sign,
+        );
+        let _ = graph;
+        Self {
+            dimensions: [request.width, request.height, request.depth],
+            plane_origin: origin,
+            row_origin: origin,
+            cursor: origin,
+            indices: [0, 0, 0],
+            done: false,
+            processed: 0,
+            total: request.block_count(),
+        }
+    }
+
+    fn next(&mut self, graph: &mut Graph) -> Option<VoxelCursor> {
+        if self.done {
+            return None;
+        }
+        let result = self.cursor;
+        self.processed += 1;
+        self.indices[0] += 1;
+        if self.indices[0] < self.dimensions[0] {
+            self.cursor = step_offset(
+                self.cursor,
+                graph,
+                0,
+                centered_offset(self.indices[0] - 1),
+                centered_offset(self.indices[0]),
+            );
+            return Some(result);
+        }
+        self.indices[0] = 0;
+        self.indices[1] += 1;
+        if self.indices[1] < self.dimensions[1] {
+            self.row_origin = step_offset(
+                self.row_origin,
+                graph,
+                1,
+                centered_offset(self.indices[1] - 1),
+                centered_offset(self.indices[1]),
+            );
+            self.cursor = self.row_origin;
+            return Some(result);
+        }
+        self.indices[1] = 0;
+        self.indices[2] += 1;
+        if self.indices[2] < self.dimensions[2] {
+            self.plane_origin = self.plane_origin.step_ensuring(graph, 2, CoordSign::Plus);
+            self.row_origin = self.plane_origin;
+            self.cursor = self.plane_origin;
+        } else {
+            self.done = true;
+        }
+        Some(result)
+    }
+
+    fn finished(&self) -> bool {
+        self.done
+    }
+
+    fn remaining(&self) -> u64 {
+        self.total.saturating_sub(self.processed)
+    }
+}
+
+fn centered_offset(index: u16) -> i32 {
+    if index == 0 {
+        0
+    } else if index % 2 == 1 {
+        i32::from(index.div_ceil(2))
+    } else {
+        -i32::from(index / 2)
+    }
+}
+
+fn step_offset(
+    mut cursor: VoxelCursor,
+    graph: &mut Graph,
+    axis: usize,
+    from: i32,
+    to: i32,
+) -> VoxelCursor {
+    let delta = to - from;
+    let sign = if delta >= 0 {
+        CoordSign::Plus
+    } else {
+        CoordSign::Minus
+    };
+    for _ in 0..delta.unsigned_abs() {
+        cursor = cursor.step_ensuring(graph, axis, sign);
+    }
+    cursor
 }
 
 fn return_character_to_spawn(position: &mut Position, state: &mut CharacterState) {
@@ -772,6 +960,48 @@ mod return_to_spawn_tests {
         assert_eq!(state.velocity, na::Vector3::zeros());
         assert!(!state.on_ground);
         assert_eq!(state.orientation, na::UnitQuaternion::identity());
+    }
+
+    #[test]
+    fn admin_dig_job_visits_requested_volume_near_first() {
+        let mut graph = Graph::new(12);
+        let request = AdminDigRequest {
+            chunk_id: ChunkId::new(NodeId::ROOT, Vertex::A),
+            coords: common::voxel_math::Coords([6, 6, 6]),
+            face_axis: common::voxel_math::CoordAxis::Z,
+            face_sign: CoordSign::Plus,
+            width: 3,
+            height: 3,
+            depth: 2,
+        };
+        let mut job = AdminDigJob::new(&mut graph, request);
+        let first = job.next(&mut graph).unwrap();
+        assert_eq!(first.chunk, request.chunk_id);
+        assert_eq!(first.coords, request.coords);
+        let mut visited = std::collections::HashSet::new();
+        visited.insert((first.chunk, first.coords.0));
+        while let Some(cursor) = job.next(&mut graph) {
+            visited.insert((cursor.chunk, cursor.coords.0));
+        }
+        assert_eq!(visited.len(), request.block_count() as usize);
+        assert_eq!(job.remaining(), 0);
+        assert!(job.finished());
+    }
+
+    #[test]
+    fn maximum_admin_dig_is_stored_compactly() {
+        let mut graph = Graph::new(12);
+        let request = AdminDigRequest {
+            chunk_id: ChunkId::new(NodeId::ROOT, Vertex::A),
+            coords: common::voxel_math::Coords([6, 6, 6]),
+            face_axis: common::voxel_math::CoordAxis::Z,
+            face_sign: CoordSign::Plus,
+            width: 1_000,
+            height: 1_000,
+            depth: 1_000,
+        };
+        let job = AdminDigJob::new(&mut graph, request);
+        assert_eq!(job.remaining(), 1_000_000_000);
     }
 }
 

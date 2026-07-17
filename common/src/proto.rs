@@ -5,7 +5,7 @@ use crate::{
     voxel_math::Coords, world::Material,
 };
 
-pub const PROTOCOL_VERSION: u32 = 1;
+pub const PROTOCOL_VERSION: u32 = 2;
 
 #[derive(Debug, Serialize, Deserialize)]
 pub struct ClientHello {
@@ -43,6 +43,7 @@ pub struct StateDelta {
     pub latest_input: u16,
     pub positions: Vec<(EntityId, Position)>,
     pub character_states: Vec<(EntityId, CharacterState)>,
+    pub admin_dig_remaining: Vec<(EntityId, u64)>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -82,6 +83,35 @@ pub struct CharacterInput {
     #[serde(default)]
     pub return_to_spawn: bool,
     pub block_update: Option<BlockUpdate>,
+    #[serde(default)]
+    pub admin_dig: Option<AdminDigRequest>,
+    #[serde(default)]
+    pub cancel_admin_dig: bool,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+pub struct AdminDigRequest {
+    pub chunk_id: ChunkId,
+    pub coords: Coords,
+    pub face_axis: crate::voxel_math::CoordAxis,
+    pub face_sign: crate::voxel_math::CoordSign,
+    pub width: u16,
+    pub height: u16,
+    pub depth: u16,
+}
+
+impl AdminDigRequest {
+    pub const MAX_AXIS: u16 = 1_000;
+
+    pub fn is_valid(self) -> bool {
+        (1..=Self::MAX_AXIS).contains(&self.width)
+            && (1..=Self::MAX_AXIS).contains(&self.height)
+            && (1..=Self::MAX_AXIS).contains(&self.depth)
+    }
+
+    pub fn block_count(self) -> u64 {
+        u64::from(self.width) * u64::from(self.height) * u64::from(self.depth)
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

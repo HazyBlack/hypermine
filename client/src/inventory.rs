@@ -7,6 +7,21 @@ pub const HOTBAR_SLOTS: usize = 9;
 pub const STORAGE_SLOTS: usize = 27;
 pub const INVENTORY_SLOTS: usize = HOTBAR_SLOTS + STORAGE_SLOTS;
 pub const STACK_LIMIT: u16 = 64;
+pub const ADMIN_PICK_ITEM_ID: u16 = 40;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[repr(u16)]
+pub enum Tool {
+    AdminPick = ADMIN_PICK_ITEM_ID,
+}
+
+impl Tool {
+    pub fn display_name(self) -> &'static str {
+        match self {
+            Self::AdminPick => "Admin Pick",
+        }
+    }
+}
 
 const DEFAULT_HOTBAR: [Material; HOTBAR_SLOTS] = [
     Material::WoodPlanks,
@@ -24,24 +39,39 @@ const DEFAULT_HOTBAR: [Material; HOTBAR_SLOTS] = [
 #[serde(default)]
 pub struct ItemStack {
     pub material: Option<Material>,
+    pub tool: Option<Tool>,
     pub count: u16,
 }
 
 impl ItemStack {
     pub const EMPTY: Self = Self {
         material: None,
+        tool: None,
         count: 0,
     };
 
     pub const fn new(material: Material, count: u16) -> Self {
         Self {
             material: Some(material),
+            tool: None,
             count,
         }
     }
 
+    pub const fn tool(tool: Tool) -> Self {
+        Self {
+            material: None,
+            tool: Some(tool),
+            count: 1,
+        }
+    }
+
+    pub fn same_item(self, other: Self) -> bool {
+        self.material == other.material && self.tool == other.tool
+    }
+
     pub fn is_empty(self) -> bool {
-        self.material.is_none() || self.count == 0
+        (self.material.is_none() && self.tool.is_none()) || self.count == 0
     }
 }
 
@@ -73,8 +103,13 @@ impl InventoryLayout {
         self.slots.truncate(INVENTORY_SLOTS);
         self.selected_hotbar = self.selected_hotbar.min(HOTBAR_SLOTS - 1);
         for slot in &mut self.slots {
-            if slot.material == Some(Material::Void) || slot.count == 0 {
+            if slot.material == Some(Material::Void)
+                || (slot.material.is_some() && slot.tool.is_some())
+                || slot.count == 0
+            {
                 *slot = ItemStack::EMPTY;
+            } else if slot.tool.is_some() {
+                slot.count = 1;
             } else {
                 slot.count = slot.count.min(STACK_LIMIT);
             }
@@ -117,11 +152,20 @@ impl InventoryLayout {
         self.sanitize();
         if unlimited {
             for slot in &mut self.slots {
-                if slot.material.is_some() {
+                if slot.tool.is_some() {
+                    slot.count = 1;
+                } else if slot.material.is_some() {
                     slot.count = STACK_LIMIT;
                 }
             }
             return;
+        }
+
+        // Admin tools are creative-only and never enter the authoritative survival inventory.
+        for slot in &mut self.slots {
+            if slot.tool.is_some() {
+                *slot = ItemStack::EMPTY;
+            }
         }
 
         let mut remaining = *counts;
@@ -177,9 +221,17 @@ impl InventoryLayout {
         };
         if unlimited {
             if let Some(stack) = held.filter(|stack| !stack.is_empty()) {
-                *slot = ItemStack::new(stack.material.unwrap(), STACK_LIMIT);
+                *slot = if let Some(tool) = stack.tool {
+                    ItemStack::tool(tool)
+                } else {
+                    ItemStack::new(stack.material.unwrap(), STACK_LIMIT)
+                };
             } else if !slot.is_empty() {
-                *held = Some(ItemStack::new(slot.material.unwrap(), STACK_LIMIT));
+                *held = Some(if let Some(tool) = slot.tool {
+                    ItemStack::tool(tool)
+                } else {
+                    ItemStack::new(slot.material.unwrap(), STACK_LIMIT)
+                });
             }
             return;
         }
@@ -187,7 +239,8 @@ impl InventoryLayout {
         match (*held, *slot) {
             (Some(mut cursor), target)
                 if !cursor.is_empty()
-                    && cursor.material == target.material
+                    && cursor.same_item(target)
+                    && cursor.tool.is_none()
                     && target.count < STACK_LIMIT =>
             {
                 let moved = cursor.count.min(STACK_LIMIT - target.count);
@@ -210,7 +263,7 @@ impl InventoryLayout {
             return;
         }
         for slot in &mut self.slots {
-            if slot.material == cursor.material && slot.count < STACK_LIMIT {
+            if slot.same_item(cursor) && slot.tool.is_none() && slot.count < STACK_LIMIT {
                 let moved = cursor.count.min(STACK_LIMIT - slot.count);
                 slot.count += moved;
                 cursor.count -= moved;

@@ -2,6 +2,7 @@ use ash::{Device, vk};
 use vk_shader_macros::include_glsl;
 
 use super::{Base, as_bytes};
+use common::voxel_math::Coords;
 use common::{defer, graph_ray_casting::GraphCastHit};
 
 const VERT: &[u32] = include_glsl!("shaders/selection.vert");
@@ -140,12 +141,33 @@ impl Selection {
         dimension: u32,
         hit: &GraphCastHit,
     ) {
+        unsafe {
+            self.draw_voxel(
+                device,
+                cmd,
+                projection,
+                dimension,
+                &hit.chunk_to_view,
+                hit.voxel_coords,
+            );
+        }
+    }
+
+    pub unsafe fn draw_voxel(
+        &self,
+        device: &Device,
+        cmd: vk::CommandBuffer,
+        projection: &na::Matrix4<f32>,
+        dimension: u32,
+        chunk_to_view: &na::Matrix4<f32>,
+        coords: Coords,
+    ) {
         let constants = PushConstants {
-            chunk_to_clip: projection * hit.chunk_to_view,
+            chunk_to_clip: projection * chunk_to_view,
             voxel_and_dimension: [
-                u32::from(hit.voxel_coords.0[0]),
-                u32::from(hit.voxel_coords.0[1]),
-                u32::from(hit.voxel_coords.0[2]),
+                u32::from(coords.0[0]),
+                u32::from(coords.0[1]),
+                u32::from(coords.0[2]),
                 dimension,
             ],
             color: [0.18, 0.78, 1.0, 0.34],

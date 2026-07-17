@@ -511,17 +511,31 @@ impl Draw {
                 }
             }
 
-            if let Some(sim) = sim.as_deref()
-                && sim.geometry_preview_enabled()
-                && let Some(hit) = sim.looking_at()
-            {
-                self.selection.draw(
-                    device,
-                    cmd,
-                    projection.matrix(),
-                    u32::from(sim.cfg.chunk_size),
-                    &hit,
-                );
+            if let Some(sim) = sim.as_deref() {
+                if sim.admin_pick_selected() {
+                    // Individual overlays make small edits exact. Large operations preview the
+                    // nearest affected blocks while the HUD reports their full dimensions/count.
+                    for preview in sim.admin_pick_preview(512) {
+                        self.selection.draw_voxel(
+                            device,
+                            cmd,
+                            projection.matrix(),
+                            u32::from(sim.cfg.chunk_size),
+                            &preview.chunk_to_view,
+                            preview.coords,
+                        );
+                    }
+                } else if sim.geometry_preview_enabled()
+                    && let Some(hit) = sim.looking_at()
+                {
+                    self.selection.draw(
+                        device,
+                        cmd,
+                        projection.matrix(),
+                        u32::from(sim.cfg.chunk_size),
+                        &hit,
+                    );
+                }
             }
 
             device.cmd_next_subpass(cmd, vk::SubpassContents::INLINE);

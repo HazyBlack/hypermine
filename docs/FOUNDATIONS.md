@@ -19,6 +19,18 @@ costs, drops, and undo data. A batch is rejected when it exceeds 65,536 edits. I
 should group dirty chunks, network deltas, mesh invalidation, drops, and undo history around the
 logical batch instead of treating every voxel as a separate player action.
 
+The creative-only Admin Pick is item ID 40; it is deliberately not a `Material`, so it can never
+be placed as a block or serialized into voxel terrain. Its tool-local width, height, and depth axes
+are transported through chunk-axis permutations by `VoxelCursor`, keeping the selected volume
+coherent across the hyperbolic tiling.
+
+Admin digs are compact jobs rather than preallocated edit lists. Each axis is bounded to 1,000,
+including the one-billion-block maximum volume, and jobs visit the aimed block first before
+expanding outward. The server applies at most 1,024 candidate edits per player per simulation step,
+reports remaining work to the client, and supports cancellation. This prevents a large request from
+allocating a billion records or monopolizing one frame, though enormous jobs can still take a long
+time and create correspondingly large saves.
+
 ## Transient geometry previews
 
 Selection, block-damage cracks, geodesic construction guides, region boundaries, and drill
