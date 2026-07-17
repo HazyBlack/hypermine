@@ -7,7 +7,9 @@ use serde::{Deserialize, Serialize};
 use crate::collision_math::Ray;
 use crate::dodeca::Vertex;
 use crate::graph::{Graph, NodeId};
-use crate::proto::{BlockEditBatch, BlockUpdate, Position, SerializedVoxelData, VoxelEdit};
+use crate::proto::{
+    BlockEditBatch, BlockUpdate, ChunkVoxelEdits, Position, SerializedVoxelData, VoxelEdit,
+};
 use crate::voxel_math::{ChunkDirection, CoordAxis, CoordSign, Coords};
 use crate::world::Material;
 use crate::worldgen::{NodeState, PartialNodeState};
@@ -227,6 +229,49 @@ impl Graph {
             .iter()
             .filter(|edit| self.update_voxel(edit))
             .count()
+    }
+
+    /// Applies edits already grouped by chunk, invalidating its surface once and only reconciling
+    /// margins for coordinates that actually touch a chunk boundary.
+    pub fn update_chunk_edits(&mut self, batch: &ChunkVoxelEdits) -> usize {
+        let dimension = self.layout().dimension;
+        let mut boundary_edits = Vec::new();
+        let accepted = {
+            let Chunk::Populated {
+                voxels,
+                surface,
+                old_surface,
+            } = &mut self[batch.chunk_id]
+            else {
+                return 0;
+            };
+            let data = voxels.data_mut(dimension);
+            let mut accepted = 0;
+            for &(coords, material) in &batch.edits {
+                let Some(voxel) = data.get_mut(coords.to_index(dimension)) else {
+                    continue;
+                };
+                *voxel = material;
+                accepted += 1;
+                if ChunkDirection::iter().any(|direction| {
+                    coords[direction.axis] == Coords::boundary_coord(dimension, direction.sign)
+                }) {
+                    boundary_edits.push(coords);
+                }
+            }
+            if accepted > 0 {
+                *old_surface = surface.take().or(*old_surface);
+            }
+            accepted
+        };
+        for coords in boundary_edits {
+            for direction in ChunkDirection::iter().filter(|direction| {
+                coords[direction.axis] == Coords::boundary_coord(dimension, direction.sign)
+            }) {
+                margins::reconcile_margin_voxels(self, batch.chunk_id, coords, direction);
+            }
+        }
+        accepted
     }
 }
 
@@ -514,6 +559,29 @@ mod tests {
     use crate::math::{MDirection, MIsometry, MPoint, MVector};
 
     use super::*;
+
+    #[test]
+    fn grouped_chunk_edits_apply_as_one_storage_operation() {
+        let mut graph = Graph::new(4);
+        let chunk_id = ChunkId::new(NodeId::ROOT, Vertex::A);
+        graph.populate_chunk(chunk_id, VoxelData::Solid(Material::Dirt));
+        let batch = ChunkVoxelEdits {
+            chunk_id,
+            edits: vec![
+                (Coords([1, 1, 1]), Material::Void),
+                (Coords([2, 1, 1]), Material::Void),
+            ],
+        };
+        assert_eq!(graph.update_chunk_edits(&batch), 2);
+        assert_eq!(
+            graph.get_material(chunk_id, Coords([1, 1, 1])),
+            Some(Material::Void)
+        );
+        assert_eq!(
+            graph.get_material(chunk_id, Coords([2, 1, 1])),
+            Some(Material::Void)
+        );
+    }
 
     /// Any voxel AABB should at least cover a capsule-shaped region consisting of all points
     /// `radius` units away from the ray's line segment. This region consists of two spheres

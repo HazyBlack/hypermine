@@ -22,6 +22,7 @@ fn main() {
     let dirs = directories::ProjectDirs::from("", "", "hypermine").unwrap();
     let mut config = Config::load(&dirs);
     let worlds = WorldManager::load(&dirs, config.save.clone());
+    let start_in_title = std::env::var_os("HYPERMINE_AUTOPLAY_ONCE").is_none();
     config.save = worlds.selected_save();
     let config = Arc::new(config);
     let settings = Rc::new(RefCell::new(SettingsStore::load(&dirs)));
@@ -85,6 +86,7 @@ fn main() {
         worlds,
         window: None,
         net: Some(net),
+        start_in_title,
     };
 
     let event_loop = EventLoop::new().unwrap();
@@ -100,6 +102,7 @@ struct App {
     worlds: Rc<RefCell<WorldManager>>,
     window: Option<graphics::Window>,
     net: Option<server::Handle>,
+    start_in_title: bool,
 }
 
 impl ApplicationHandler for App {
@@ -117,6 +120,7 @@ impl ApplicationHandler for App {
             self.net.take().unwrap(),
             Rc::clone(&self.settings),
             Rc::clone(&self.worlds),
+            self.start_in_title,
         );
 
         // Initialize widely-shared graphics resources

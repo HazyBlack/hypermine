@@ -4,7 +4,9 @@ use anyhow::Context;
 use common::dodeca::{Side, Vertex};
 use common::math::MIsometry;
 use common::node::VoxelData;
-use common::proto::{AdminDigRequest, BlockUpdate, Inventory, SerializedVoxelData};
+use common::proto::{
+    AdminDigRequest, BlockUpdate, ChunkVoxelEdits, Inventory, SerializedVoxelData,
+};
 use common::voxel_cursor::VoxelCursor;
 use common::voxel_math::CoordSign;
 use common::world::Material;
@@ -471,6 +473,7 @@ impl Sim {
                 .map(|(side, parent)| FreshNode { side, parent })
                 .collect(),
             block_updates: Vec::new(),
+            chunk_edits: Vec::new(),
             voxel_data: Vec::new(),
             inventory_additions: Vec::new(),
             inventory_removals: Vec::new(),
@@ -535,6 +538,7 @@ impl Sim {
 
         let mut pending_block_updates: Vec<(Entity, BlockUpdate, bool)> = vec![];
         let mut pending_admin_digs = Vec::new();
+        let mut admin_edit_backlogs = FxHashMap::default();
 
         // Simulate
         for (entity, node, position, character, input) in self
@@ -564,8 +568,9 @@ impl Sim {
             if let Some(block_update) = input.block_update.clone() {
                 pending_block_updates.push((entity, block_update, input.creative));
             }
+            let id = *self.world.get::<&EntityId>(entity).unwrap();
+            admin_edit_backlogs.insert(id, input.admin_edit_backlog);
             if !input.creative || input.cancel_admin_dig || input.admin_dig.is_some() {
-                let id = *self.world.get::<&EntityId>(entity).unwrap();
                 pending_admin_digs.push((
                     id,
                     input.admin_dig,
@@ -594,7 +599,7 @@ impl Sim {
             input.admin_dig = None;
             input.cancel_admin_dig = false;
         }
-        self.process_admin_digs();
+        self.process_admin_digs(&admin_edit_backlogs);
 
         self.update_entity_node_ids();
 
@@ -770,13 +775,19 @@ impl Sim {
         self.accumulated_changes.block_updates.push(block_update);
     }
 
-    fn process_admin_digs(&mut self) {
+    fn process_admin_digs(&mut self, client_backlogs: &FxHashMap<EntityId, u32>) {
         const EDITS_PER_PLAYER_PER_STEP: usize = 1_024;
+        const PAUSE_AT_CLIENT_BACKLOG: u32 = 16_384;
         let ids = self.admin_digs.keys().copied().collect::<Vec<_>>();
+        let mut edits_by_chunk: FxHashMap<ChunkId, Vec<_>> = FxHashMap::default();
         for id in ids {
             let Some(mut job) = self.admin_digs.remove(&id) else {
                 continue;
             };
+            if client_backlogs.get(&id).copied().unwrap_or_default() >= PAUSE_AT_CLIENT_BACKLOG {
+                self.admin_digs.insert(id, job);
+                continue;
+            }
             for _ in 0..EDITS_PER_PLAYER_PER_STEP {
                 let Some(cursor) = job.next(&mut self.graph) else {
                     break;
@@ -794,20 +805,21 @@ impl Sim {
                 if self.graph.get_material(chunk, cursor.coords) == Some(Material::Void) {
                     continue;
                 }
-                let update = BlockUpdate {
-                    chunk_id: chunk,
-                    coords: cursor.coords,
-                    new_material: Material::Void,
-                    consumed_entity: None,
-                };
-                if self.graph.update_block(&update) {
-                    self.modified_chunks.insert(chunk);
-                    self.dirty_voxel_nodes.insert(chunk.node);
-                    self.accumulated_changes.block_updates.push(update);
-                }
+                edits_by_chunk
+                    .entry(chunk)
+                    .or_default()
+                    .push((cursor.coords, Material::Void));
             }
             if !job.finished() {
                 self.admin_digs.insert(id, job);
+            }
+        }
+        for (chunk_id, edits) in edits_by_chunk {
+            let batch = ChunkVoxelEdits { chunk_id, edits };
+            if self.graph.update_chunk_edits(&batch) > 0 {
+                self.modified_chunks.insert(chunk_id);
+                self.dirty_voxel_nodes.insert(chunk_id.node);
+                self.accumulated_changes.chunk_edits.push(batch);
             }
         }
     }
@@ -1042,6 +1054,9 @@ struct AccumulatedChanges {
     /// Block updates that have been applied to the world since the last broadcast
     block_updates: Vec<BlockUpdate>,
 
+    /// Bulk edits grouped by chunk so large tools do not flood clients with repeated addresses.
+    chunk_edits: Vec<ChunkVoxelEdits>,
+
     /// Entities that have been added to an inventory since the last broadcast, where `(a, b)`` represents
     /// entity `b`` being added to inventory `a``
     inventory_additions: Vec<(EntityId, EntityId)>,
@@ -1059,6 +1074,7 @@ impl AccumulatedChanges {
         self.spawns.is_empty()
             && self.despawns.is_empty()
             && self.block_updates.is_empty()
+            && self.chunk_edits.is_empty()
             && self.inventory_additions.is_empty()
             && self.inventory_removals.is_empty()
             && self.fresh_nodes.is_empty()
@@ -1096,6 +1112,7 @@ impl AccumulatedChanges {
                 })
                 .collect(),
             block_updates: self.block_updates,
+            chunk_edits: self.chunk_edits,
             voxel_data: Vec::new(),
             inventory_additions: self.inventory_additions,
             inventory_removals: self.inventory_removals,

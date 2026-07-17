@@ -19,6 +19,7 @@ use super::material_icons::MaterialIcons;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum MenuScreen {
+    Title,
     Closed,
     Pause,
     Options,
@@ -28,12 +29,15 @@ enum MenuScreen {
     Inventory,
     Worlds,
     CreateWorld,
+    ConfigureWorld,
+    DeleteWorld,
 }
 
 #[derive(Default)]
 pub struct GuiAction {
     pub quit: bool,
     pub restart: bool,
+    pub play_after_restart: bool,
     pub video_changed: bool,
     pub display_mode_changed: bool,
 }
@@ -44,11 +48,15 @@ pub struct GuiState {
     show_debug: bool,
     guide_home: bool,
     screen: MenuScreen,
+    title_flow: bool,
     rebinding: Option<Action>,
     new_world_name: String,
     status: Option<String>,
     control_page: usize,
     world_page: usize,
+    world_selection: Option<String>,
+    edit_world_name: String,
+    edit_world_creative: bool,
     icons: MaterialIcons,
     held_stack: Option<ItemStack>,
     cursor_position: [f32; 2],
@@ -58,18 +66,26 @@ pub struct GuiState {
 }
 
 impl GuiState {
-    pub fn new(icons: MaterialIcons) -> Self {
+    pub fn new(icons: MaterialIcons, start_in_title: bool) -> Self {
         Self {
             show_hud: true,
             show_navigation: false,
             show_debug: false,
             guide_home: false,
-            screen: MenuScreen::Closed,
+            screen: if start_in_title {
+                MenuScreen::Title
+            } else {
+                MenuScreen::Closed
+            },
+            title_flow: start_in_title,
             rebinding: None,
             new_world_name: "New World".to_owned(),
             status: None,
             control_page: 0,
             world_page: 0,
+            world_selection: None,
+            edit_world_name: String::new(),
+            edit_world_creative: false,
             icons,
             held_stack: None,
             cursor_position: [0.0, 0.0],
@@ -212,14 +228,27 @@ impl GuiState {
         self.rebinding = None;
         self.status = None;
         self.screen = match self.screen {
-            MenuScreen::Closed => MenuScreen::Pause,
+            MenuScreen::Title => MenuScreen::Title,
+            MenuScreen::Closed => {
+                self.title_flow = false;
+                MenuScreen::Pause
+            }
             MenuScreen::Pause => MenuScreen::Closed,
-            MenuScreen::Options | MenuScreen::Worlds => MenuScreen::Pause,
+            MenuScreen::Options | MenuScreen::Worlds => self.root_menu(),
             MenuScreen::Video | MenuScreen::Controls => MenuScreen::Options,
             MenuScreen::Bindings => MenuScreen::Controls,
             MenuScreen::Inventory => MenuScreen::Closed,
             MenuScreen::CreateWorld => MenuScreen::Worlds,
+            MenuScreen::ConfigureWorld | MenuScreen::DeleteWorld => MenuScreen::Worlds,
         };
+    }
+
+    fn root_menu(&self) -> MenuScreen {
+        if self.title_flow {
+            MenuScreen::Title
+        } else {
+            MenuScreen::Pause
+        }
     }
 
     pub fn capture_binding(&mut self, key: String, settings: &mut SettingsStore) -> bool {
@@ -269,6 +298,7 @@ impl GuiState {
                         sim.admin_pick_dimensions(),
                         sim.admin_pick_block_count(),
                         sim.admin_dig_remaining(),
+                        sim.pending_chunk_edit_count(),
                     )
                 })
             });
@@ -300,6 +330,7 @@ impl GuiState {
 
         let mut next_screen = None;
         match self.screen {
+            MenuScreen::Title => self.title_menu(worlds, &mut next_screen, &mut action),
             MenuScreen::Closed => {}
             MenuScreen::Pause => self.pause_menu(worlds, &mut next_screen, &mut action),
             MenuScreen::Options => self.options_menu(&mut next_screen),
@@ -316,10 +347,16 @@ impl GuiState {
                 self.inventory_menu(sim, settings, &world_id, &mut next_screen);
             }
             MenuScreen::Worlds => {
-                self.worlds_menu(worlds, &mut next_screen, &mut action);
+                self.worlds_menu(worlds, settings, &mut next_screen, &mut action);
             }
             MenuScreen::CreateWorld => {
                 self.create_world_menu(worlds, &mut next_screen, &mut action);
+            }
+            MenuScreen::ConfigureWorld => {
+                self.configure_world_menu(worlds, settings, &mut next_screen);
+            }
+            MenuScreen::DeleteWorld => {
+                self.delete_world_menu(worlds, settings, &mut next_screen, &mut action);
             }
         }
         if let Some(screen) = next_screen {
@@ -338,7 +375,7 @@ impl GuiState {
         layout: &crate::inventory::InventoryLayout,
         unlimited: bool,
         geometry_preview: Option<bool>,
-        admin_pick: Option<([u16; 3], u64, Option<u64>)>,
+        admin_pick: Option<([u16; 3], u64, Option<u64>, usize)>,
     ) {
         align(Alignment::CENTER, || {
             colored_box(Color::WHITE.with_alpha(0.9), [3.0, 15.0]);
@@ -354,7 +391,7 @@ impl GuiState {
                 list.cross_axis_alignment = CrossAxisAlignment::Center;
                 list.main_axis_size = MainAxisSize::Min;
                 list.show(|| {
-                    if let Some(([width, height, depth], count, remaining)) = admin_pick {
+                    if let Some(([width, height, depth], count, remaining, pending)) = admin_pick {
                         colored_box_container(Color::BLACK.with_alpha(0.78), || {
                             pad(Pad::balanced(10.0, 4.0), || {
                                 let previewed = count.min(512);
@@ -366,6 +403,9 @@ impl GuiState {
                                     label(format!(
                                         "{remaining} blocks remaining - right-click to cancel"
                                     ));
+                                }
+                                if pending > 0 {
+                                    label(format!("Applying {pending} streamed block changes"));
                                 }
                                 label(if count <= 512 {
                                     "All affected blocks highlighted - left-click dig - right-click cancel".to_owned()
@@ -816,10 +856,43 @@ impl GuiState {
                 *next = Some(MenuScreen::Closed);
             }
             if menu_button("Options...") {
+                self.title_flow = false;
                 *next = Some(MenuScreen::Options);
             }
             if menu_button("Worlds...") {
+                self.title_flow = false;
                 *next = Some(MenuScreen::Worlds);
+            }
+            if menu_button("Main Menu") {
+                self.title_flow = true;
+                *next = Some(MenuScreen::Title);
+            }
+            if menu_button("Quit Game") {
+                action.quit = true;
+            }
+        });
+    }
+
+    fn title_menu(
+        &mut self,
+        worlds: &WorldManager,
+        next: &mut Option<MenuScreen>,
+        action: &mut GuiAction,
+    ) {
+        menu_panel("Hypermine", || {
+            text(18.0, "Master an impossible world".to_owned());
+            label(format!("Selected World: {}", worlds.selected_name()));
+            if menu_button("Play Selected World") {
+                *next = Some(MenuScreen::Closed);
+            }
+            if menu_button("Worlds...") {
+                self.title_flow = true;
+                self.world_selection = Some(worlds.selected_id().to_owned());
+                *next = Some(MenuScreen::Worlds);
+            }
+            if menu_button("Options...") {
+                self.title_flow = true;
+                *next = Some(MenuScreen::Options);
             }
             if menu_button("Quit Game") {
                 action.quit = true;
@@ -836,7 +909,7 @@ impl GuiState {
                 *next = Some(MenuScreen::Controls);
             }
             if menu_button("Done") {
-                *next = Some(MenuScreen::Pause);
+                *next = Some(self.root_menu());
             }
         });
     }
@@ -974,17 +1047,26 @@ impl GuiState {
     fn worlds_menu(
         &mut self,
         worlds: &mut WorldManager,
+        settings: &mut SettingsStore,
         next: &mut Option<MenuScreen>,
         action: &mut GuiAction,
     ) {
         let entries = worlds.worlds().to_vec();
         let selected = worlds.selected_id().to_owned();
+        if self
+            .world_selection
+            .as_ref()
+            .is_none_or(|focused| !entries.iter().any(|world| &world.id == focused))
+        {
+            self.world_selection = Some(selected.clone());
+        }
+        let focused = self.world_selection.clone().unwrap_or(selected.clone());
         const PER_PAGE: usize = 4;
         let page_count = entries.len().div_ceil(PER_PAGE).max(1);
         self.world_page = self.world_page.min(page_count - 1);
         let start = self.world_page * PER_PAGE;
         menu_panel("Worlds", || {
-            label("Each world has its own save and generated terrain.");
+            label("Each world has its own terrain, inventory, and save.");
             label(format!(
                 "World List — Page {} of {page_count}",
                 self.world_page + 1
@@ -992,15 +1074,14 @@ impl GuiState {
             for index in 0..PER_PAGE {
                 if let Some(world) = entries.get(start + index) {
                     let marker = if world.id == selected {
-                        "  [Current]"
+                        " [Loaded]"
+                    } else if world.id == focused {
+                        " [Selected]"
                     } else {
                         ""
                     };
-                    if menu_button(format!("{}{}", world.name, marker)) && world.id != selected {
-                        match worlds.select(&world.id) {
-                            Ok(()) => action.restart = true,
-                            Err(error) => self.status = Some(error.to_string()),
-                        }
+                    if menu_button(format!("{}{}", world.name, marker)) {
+                        self.world_selection = Some(world.id.clone());
                     }
                 } else {
                     let _ = menu_button("— empty slot —");
@@ -1025,8 +1106,31 @@ impl GuiState {
             if menu_button("Create New World...") {
                 *next = Some(MenuScreen::CreateWorld);
             }
+            if menu_button("Play Selected World") {
+                if focused == selected {
+                    *next = Some(MenuScreen::Closed);
+                } else {
+                    match worlds.select(&focused) {
+                        Ok(()) => {
+                            action.restart = true;
+                            action.play_after_restart = true;
+                        }
+                        Err(error) => self.status = Some(error.to_string()),
+                    }
+                }
+            }
+            if menu_button("Configure Selected...")
+                && let Some(world) = entries.iter().find(|world| world.id == focused)
+            {
+                self.edit_world_name = world.name.clone();
+                self.edit_world_creative = settings.value.inventory.layout(&world.id).creative_tab;
+                *next = Some(MenuScreen::ConfigureWorld);
+            }
+            if menu_button("Delete Selected...") {
+                *next = Some(MenuScreen::DeleteWorld);
+            }
             if menu_button("Back") {
-                *next = Some(MenuScreen::Pause);
+                *next = Some(self.root_menu());
             }
             if let Some(status) = &self.status {
                 label(status.clone());
@@ -1050,7 +1154,127 @@ impl GuiState {
                 && !self.new_world_name.trim().is_empty()
             {
                 match worlds.create(&self.new_world_name) {
-                    Ok(_) => action.restart = true,
+                    Ok(_) => {
+                        action.restart = true;
+                        action.play_after_restart = true;
+                    }
+                    Err(error) => self.status = Some(error.to_string()),
+                }
+            }
+            if menu_button("Cancel") {
+                *next = Some(MenuScreen::Worlds);
+            }
+            if let Some(status) = &self.status {
+                label(status.clone());
+            }
+        });
+    }
+
+    fn configure_world_menu(
+        &mut self,
+        worlds: &mut WorldManager,
+        settings: &mut SettingsStore,
+        next: &mut Option<MenuScreen>,
+    ) {
+        let Some(world_id) = self.world_selection.clone() else {
+            *next = Some(MenuScreen::Worlds);
+            return;
+        };
+        let Some(world) = worlds
+            .worlds()
+            .iter()
+            .find(|world| world.id == world_id)
+            .cloned()
+        else {
+            *next = Some(MenuScreen::Worlds);
+            return;
+        };
+        menu_panel("Configure World", || {
+            label("Display Name");
+            let response = textbox(self.edit_world_name.clone());
+            if let Some(name) = response.text.as_ref() {
+                self.edit_world_name = name.clone();
+            }
+            let mode = if self.edit_world_creative {
+                "Creative"
+            } else {
+                "Survival"
+            };
+            if menu_button(format!("Inventory Mode: {mode}")) {
+                self.edit_world_creative = !self.edit_world_creative;
+            }
+            label("This changes inventory access, not generated terrain.");
+            label(format!("Internal ID: {}", world.id));
+            label(format!(
+                "Versions: save {} / blocks {} / generation {}",
+                world.format_version, world.content_registry_version, world.worldgen_version
+            ));
+            if menu_button("Save Changes") {
+                match worlds.rename(&world_id, &self.edit_world_name) {
+                    Ok(()) => {
+                        settings.value.inventory.layout_mut(&world_id).creative_tab =
+                            self.edit_world_creative;
+                        settings.save();
+                        self.status = Some("World configuration saved.".to_owned());
+                        *next = Some(MenuScreen::Worlds);
+                    }
+                    Err(error) => self.status = Some(error.to_string()),
+                }
+            }
+            if menu_button("Cancel") {
+                *next = Some(MenuScreen::Worlds);
+            }
+            if let Some(status) = &self.status {
+                label(status.clone());
+            }
+        });
+    }
+
+    fn delete_world_menu(
+        &mut self,
+        worlds: &mut WorldManager,
+        settings: &mut SettingsStore,
+        next: &mut Option<MenuScreen>,
+        action: &mut GuiAction,
+    ) {
+        let Some(world_id) = self.world_selection.clone() else {
+            *next = Some(MenuScreen::Worlds);
+            return;
+        };
+        let Some(world_name) = worlds
+            .worlds()
+            .iter()
+            .find(|world| world.id == world_id)
+            .map(|world| world.name.clone())
+        else {
+            *next = Some(MenuScreen::Worlds);
+            return;
+        };
+        menu_panel("Delete World?", || {
+            text(20.0, world_name.clone());
+            label("This permanently deletes this world's terrain and save data.");
+            label("This cannot be undone.");
+            if worlds.worlds().len() <= 1 {
+                label("The last world cannot be deleted. Create another world first.");
+            } else if menu_button("Permanently Delete World") {
+                match worlds.delete(&world_id) {
+                    Ok(outcome) => {
+                        settings.value.inventory.worlds.remove(&world_id);
+                        settings.save();
+                        self.world_selection = Some(worlds.selected_id().to_owned());
+                        if outcome.restart_required {
+                            action.restart = true;
+                            action.play_after_restart = false;
+                        } else {
+                            self.status = Some(if outcome.files_removed {
+                                "World deleted.".to_owned()
+                            } else {
+                                "World removed; its files will finish deleting on next launch."
+                                    .to_owned()
+                            });
+                            *next = Some(MenuScreen::Worlds);
+                        }
+                    }
                     Err(error) => self.status = Some(error.to_string()),
                 }
             }

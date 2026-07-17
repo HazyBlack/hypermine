@@ -31,6 +31,21 @@ reports remaining work to the client, and supports cancellation. This prevents a
 allocating a billion records or monopolizing one frame, though enormous jobs can still take a long
 time and create correspondingly large saves.
 
+Live Admin Pick results are transmitted as `ChunkVoxelEdits`: one chunk address followed by compact
+coordinate/material pairs. Both server and client invalidate a touched chunk once per group instead
+of once per voxel. The renderer integrates at most 4,096 bulk edits per frame, network intake is
+bounded per frame, and the client reports queued plus not-yet-loaded edits to the server. A dig
+automatically pauses at a 16,384-edit client backlog and resumes as terrain catches up. This keeps
+the authoritative save progressing without allowing the display queue to grow without bound.
+
+## World registry and deletion
+
+The version-2 world registry stores independent display names, saves, compatibility versions, and
+pending managed deletions. World configuration may rename a world and change its per-world
+creative/survival inventory mode without regenerating terrain. Deletion requires a confirmation
+screen, refuses to remove the final world, and only removes relative paths inside Hypermine's data
+directory. A loaded Windows save that is still locked is recorded for retry on the next launch.
+
 ## Transient geometry previews
 
 Selection, block-damage cracks, geodesic construction guides, region boundaries, and drill

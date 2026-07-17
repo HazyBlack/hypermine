@@ -5,7 +5,7 @@ use crate::{
     voxel_math::Coords, world::Material,
 };
 
-pub const PROTOCOL_VERSION: u32 = 2;
+pub const PROTOCOL_VERSION: u32 = 3;
 
 #[derive(Debug, Serialize, Deserialize)]
 pub struct ClientHello {
@@ -60,6 +60,7 @@ pub struct Spawns {
     pub despawns: Vec<EntityId>,
     pub nodes: Vec<FreshNode>,
     pub block_updates: Vec<BlockUpdate>,
+    pub chunk_edits: Vec<ChunkVoxelEdits>,
     pub voxel_data: Vec<(ChunkId, SerializedVoxelData)>,
     pub inventory_additions: Vec<(EntityId, EntityId)>,
     pub inventory_removals: Vec<(EntityId, EntityId)>,
@@ -87,6 +88,9 @@ pub struct CharacterInput {
     pub admin_dig: Option<AdminDigRequest>,
     #[serde(default)]
     pub cancel_admin_dig: bool,
+    /// Number of authoritative bulk edits received but not yet integrated by this client.
+    #[serde(default)]
+    pub admin_edit_backlog: u32,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize)]
@@ -120,6 +124,14 @@ pub struct BlockUpdate {
     pub coords: Coords,
     pub new_material: Material,
     pub consumed_entity: Option<EntityId>,
+}
+
+/// Compact authoritative edits for one chunk. Grouping the chunk address prevents large tools
+/// from repeating it for every voxel and lets clients invalidate the chunk mesh only once.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ChunkVoxelEdits {
+    pub chunk_id: ChunkId,
+    pub edits: Vec<(Coords, Material)>,
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
@@ -171,7 +183,7 @@ mod tests {
         dodeca::Vertex, graph::NodeId, node::ChunkId, voxel_math::Coords, world::Material,
     };
 
-    use super::{BlockEditBatch, VoxelEdit};
+    use super::{BlockEditBatch, BlockUpdate, ChunkVoxelEdits, VoxelEdit};
 
     #[test]
     fn block_edit_batches_have_a_hard_safety_budget() {
@@ -186,6 +198,46 @@ mod tests {
             BlockEditBatch::MAX_EDITS + 1
         ];
         assert!(!batch.is_within_budget());
+    }
+
+    #[test]
+    fn chunk_grouping_compacts_large_network_edits() {
+        let chunk_id = ChunkId::new(NodeId::ROOT, Vertex::A);
+        let edits = (0..1_024)
+            .map(|index| {
+                (
+                    Coords([
+                        (index % 12) as u8,
+                        ((index / 12) % 12) as u8,
+                        ((index / 144) % 12) as u8,
+                    ]),
+                    Material::Void,
+                )
+            })
+            .collect::<Vec<_>>();
+        let compact = postcard::to_stdvec(&ChunkVoxelEdits {
+            chunk_id,
+            edits: edits.clone(),
+        })
+        .unwrap();
+        let expanded = postcard::to_stdvec(
+            &edits
+                .into_iter()
+                .map(|(coords, new_material)| BlockUpdate {
+                    chunk_id,
+                    coords,
+                    new_material,
+                    consumed_entity: None,
+                })
+                .collect::<Vec<_>>(),
+        )
+        .unwrap();
+        assert!(
+            compact.len() * 3 < expanded.len() * 2,
+            "compact={} expanded={}",
+            compact.len(),
+            expanded.len()
+        );
     }
 }
 

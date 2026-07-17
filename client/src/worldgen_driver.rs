@@ -5,8 +5,10 @@ use common::{
     graph::{Graph, NodeId},
     math::MPoint,
     node::{Chunk, ChunkId, VoxelData},
-    proto::{BlockUpdate, Position},
+    proto::{BlockUpdate, ChunkVoxelEdits, Position},
     traversal,
+    voxel_math::Coords,
+    world::Material,
 };
 use fxhash::FxHashMap;
 use metrics::histogram;
@@ -17,7 +19,8 @@ pub struct WorldgenDriver {
     nearby_cache: traversal::NearbyCache,
     scan_complete: bool,
     /// Voxel data that have been downloaded from the server for chunks not yet introduced to the graph
-    preloaded_block_updates: FxHashMap<ChunkId, Vec<BlockUpdate>>,
+    preloaded_block_updates: FxHashMap<ChunkId, Vec<(Coords, Material)>>,
+    preloaded_block_update_count: usize,
     /// Voxel data that has been fetched from the server but not yet introduced to the graph
     preloaded_voxel_data: FxHashMap<ChunkId, VoxelData>,
 }
@@ -29,6 +32,7 @@ impl WorldgenDriver {
             nearby_cache: traversal::NearbyCache::default(),
             scan_complete: false,
             preloaded_block_updates: FxHashMap::default(),
+            preloaded_block_update_count: 0,
             preloaded_voxel_data: FxHashMap::default(),
         }
     }
@@ -128,21 +132,43 @@ impl WorldgenDriver {
         graph.populate_chunk(chunk_id, voxel_data);
 
         if let Some(block_updates) = self.preloaded_block_updates.remove(&chunk_id) {
-            for block_update in block_updates {
-                // The chunk was just populated, so a block update should always succeed.
-                assert!(graph.update_block(&block_update));
-            }
+            let expected = block_updates.len();
+            self.preloaded_block_update_count =
+                self.preloaded_block_update_count.saturating_sub(expected);
+            let accepted = graph.update_chunk_edits(&ChunkVoxelEdits {
+                chunk_id,
+                edits: block_updates,
+            });
+            assert_eq!(accepted, expected);
         }
     }
 
     pub fn apply_block_update(&mut self, graph: &mut Graph, block_update: BlockUpdate) {
-        if graph.update_block(&block_update) {
+        if graph.contains(block_update.chunk_id.node) && graph.update_block(&block_update) {
             return;
         }
         self.preloaded_block_updates
             .entry(block_update.chunk_id)
             .or_default()
-            .push(block_update);
+            .push((block_update.coords, block_update.new_material));
+        self.preloaded_block_update_count += 1;
+    }
+
+    pub fn apply_chunk_edits(&mut self, graph: &mut Graph, edits: ChunkVoxelEdits) {
+        if graph.contains(edits.chunk_id.node) && graph.update_chunk_edits(&edits) > 0 {
+            return;
+        }
+        self.preloaded_block_update_count = self
+            .preloaded_block_update_count
+            .saturating_add(edits.edits.len());
+        self.preloaded_block_updates
+            .entry(edits.chunk_id)
+            .or_default()
+            .extend(edits.edits);
+    }
+
+    pub fn preloaded_block_update_count(&self) -> usize {
+        self.preloaded_block_update_count
     }
 
     pub fn apply_voxel_data(

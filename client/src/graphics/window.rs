@@ -78,6 +78,7 @@ impl Window {
         net: server::Handle,
         settings: Rc<RefCell<SettingsStore>>,
         worlds: Rc<RefCell<WorldManager>>,
+        start_in_title: bool,
     ) -> Self {
         let surface = unsafe {
             ash_window::create_surface(
@@ -103,7 +104,7 @@ impl Window {
             swapchain_needs_update: false,
             draw: None,
             sim: None,
-            gui_state: GuiState::new(icons),
+            gui_state: GuiState::new(icons, start_in_title),
             yak,
             net,
             settings,
@@ -158,8 +159,16 @@ impl Window {
     pub fn handle_event(&mut self, event: WindowEvent, event_loop: &ActiveEventLoop) {
         match event {
             WindowEvent::RedrawRequested => {
-                while let Ok(msg) = self.net.incoming.try_recv() {
+                const MAX_NETWORK_MESSAGES_PER_FRAME: usize = 128;
+                const MAX_BULK_EDITS_PER_FRAME: usize = 4_096;
+                for _ in 0..MAX_NETWORK_MESSAGES_PER_FRAME {
+                    let Ok(msg) = self.net.incoming.try_recv() else {
+                        break;
+                    };
                     self.handle_net(msg);
+                }
+                if let Some(sim) = self.sim.as_mut() {
+                    sim.process_pending_chunk_edits(MAX_BULK_EDITS_PER_FRAME);
                 }
 
                 let this_frame = Instant::now();
@@ -506,6 +515,11 @@ impl Window {
         if gui_action.restart {
             match std::env::current_exe().and_then(|exe| {
                 let mut command = Command::new(exe);
+                if gui_action.play_after_restart {
+                    command.env("HYPERMINE_AUTOPLAY_ONCE", "1");
+                } else {
+                    command.env_remove("HYPERMINE_AUTOPLAY_ONCE");
+                }
                 if let Ok(directory) = std::env::current_dir() {
                     command.current_dir(directory);
                 }

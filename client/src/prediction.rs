@@ -124,6 +124,7 @@ mod tests {
             block_update: None,
             admin_dig: None,
             cancel_admin_dig: false,
+            admin_edit_backlog: 0,
         };
 
         let mut pred = PredictedMotion::new(pos());

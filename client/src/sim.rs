@@ -1,4 +1,4 @@
-use std::time::Duration;
+use std::{collections::VecDeque, time::Duration};
 
 use fxhash::FxHashMap;
 use hecs::Entity;
@@ -16,8 +16,8 @@ use common::{
     math::{MDirection, MIsometry, MPoint},
     node::VoxelData,
     proto::{
-        self, BlockUpdate, Character, CharacterInput, CharacterState, Command, Component,
-        Inventory, Position,
+        self, BlockUpdate, Character, CharacterInput, CharacterState, ChunkVoxelEdits, Command,
+        Component, Inventory, Position,
     },
     sanitize_motion_input,
     voxel_cursor::VoxelCursor,
@@ -92,6 +92,8 @@ pub struct Sim {
     admin_pick_dimensions: [u16; 3],
     admin_dig_active: bool,
     admin_dig_remaining: Option<u64>,
+    pending_chunk_edits: VecDeque<ChunkVoxelEdits>,
+    pending_chunk_edit_count: usize,
     geometry_preview: bool,
     return_to_spawn_requested: bool,
     /// Whether no_clip will be toggled next step
@@ -141,6 +143,8 @@ impl Sim {
             admin_pick_dimensions: [1, 1, 1],
             admin_dig_active: false,
             admin_dig_remaining: None,
+            pending_chunk_edits: VecDeque::new(),
+            pending_chunk_edit_count: 0,
             geometry_preview: false,
             return_to_spawn_requested: false,
             toggle_no_clip: false,
@@ -569,6 +573,33 @@ impl Sim {
         }
     }
 
+    /// Integrates a bounded amount of authoritative bulk terrain work. Keeping this outside the
+    /// network receive loop guarantees that a large Admin Pick operation cannot monopolize a frame.
+    pub fn process_pending_chunk_edits(&mut self, mut budget: usize) {
+        while budget > 0 {
+            let Some(mut batch) = self.pending_chunk_edits.pop_front() else {
+                break;
+            };
+            if batch.edits.len() > budget {
+                let remainder = batch.edits.split_off(budget);
+                self.pending_chunk_edits.push_front(ChunkVoxelEdits {
+                    chunk_id: batch.chunk_id,
+                    edits: remainder,
+                });
+            }
+            let count = batch.edits.len();
+            self.worldgen_driver
+                .apply_chunk_edits(&mut self.graph, batch);
+            self.pending_chunk_edit_count = self.pending_chunk_edit_count.saturating_sub(count);
+            budget -= count;
+        }
+    }
+
+    pub fn pending_chunk_edit_count(&self) -> usize {
+        self.pending_chunk_edit_count
+            .saturating_add(self.worldgen_driver.preloaded_block_update_count())
+    }
+
     fn update_position(&mut self, id: EntityId, new_pos: &Position) {
         match self.entity_ids.get(&id) {
             None => debug!(%id, "position update for unknown entity"),
@@ -657,6 +688,12 @@ impl Sim {
         for block_update in msg.block_updates.into_iter() {
             self.worldgen_driver
                 .apply_block_update(&mut self.graph, block_update);
+        }
+        for edits in msg.chunk_edits {
+            self.pending_chunk_edit_count = self
+                .pending_chunk_edit_count
+                .saturating_add(edits.edits.len());
+            self.pending_chunk_edits.push_back(edits);
         }
         for (chunk_id, voxel_data) in msg.voxel_data {
             let Some(voxel_data) = VoxelData::deserialize(&voxel_data, self.cfg.chunk_size) else {
@@ -747,6 +784,7 @@ impl Sim {
             block_update: self.get_local_character_block_update(),
             admin_dig,
             cancel_admin_dig,
+            admin_edit_backlog: self.pending_chunk_edit_count().min(u32::MAX as usize) as u32,
         };
         let generation = self
             .prediction
@@ -785,6 +823,7 @@ impl Sim {
             block_update: None,
             admin_dig: None,
             cancel_admin_dig: false,
+            admin_edit_backlog: self.pending_chunk_edit_count().min(u32::MAX as usize) as u32,
         };
         character_controller::run_character_step(
             &self.cfg,

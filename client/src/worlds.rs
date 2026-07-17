@@ -1,10 +1,15 @@
-use std::{fs, path::PathBuf, time::SystemTime};
+use std::{
+    fs,
+    path::{Component as PathComponent, PathBuf},
+    thread,
+    time::{Duration, SystemTime},
+};
 
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 use tracing::warn;
 
-const WORLD_REGISTRY_VERSION: u32 = 1;
+const WORLD_REGISTRY_VERSION: u32 = 2;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct WorldEntry {
@@ -26,6 +31,20 @@ struct WorldRegistry {
     version: u32,
     selected_id: String,
     worlds: Vec<WorldEntry>,
+    #[serde(default)]
+    pending_deletions: Vec<PendingWorldDeletion>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct PendingWorldDeletion {
+    id: String,
+    save: PathBuf,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DeleteWorldOutcome {
+    pub restart_required: bool,
+    pub files_removed: bool,
 }
 
 pub struct WorldManager {
@@ -60,6 +79,7 @@ impl WorldManager {
                         content_registry_version: save::CURRENT_CONTENT_REGISTRY_VERSION,
                         worldgen_version: save::CURRENT_WORLDGEN_VERSION,
                     }],
+                    pending_deletions: Vec::new(),
                 }
             });
         let mut manager = Self {
@@ -87,6 +107,7 @@ impl WorldManager {
         {
             manager.registry.selected_id = manager.registry.worlds[0].id.clone();
         }
+        manager.apply_pending_deletions();
         if let Err(error) = manager.save_registry() {
             warn!("couldn't save world registry: {error:#}");
         }
@@ -173,6 +194,118 @@ impl WorldManager {
         self.registry.selected_id = id.clone();
         self.save_registry()?;
         Ok(id)
+    }
+
+    pub fn rename(&mut self, id: &str, name: &str) -> Result<()> {
+        let name = name.trim();
+        if name.is_empty() {
+            anyhow::bail!("world name cannot be empty");
+        }
+        let world = self
+            .registry
+            .worlds
+            .iter_mut()
+            .find(|world| world.id == id)
+            .context("world does not exist")?;
+        world.name = name.to_owned();
+        let world = world.clone();
+        self.write_world_metadata(&world)?;
+        self.save_registry()
+    }
+
+    pub fn delete(&mut self, id: &str) -> Result<DeleteWorldOutcome> {
+        if self.registry.worlds.len() <= 1 {
+            anyhow::bail!("create another world before deleting the last one");
+        }
+        let index = self
+            .registry
+            .worlds
+            .iter()
+            .position(|world| world.id == id)
+            .context("world does not exist")?;
+        let world = self.registry.worlds[index].clone();
+        let pending = PendingWorldDeletion {
+            id: world.id.clone(),
+            save: world.save.clone(),
+        };
+        self.validate_world_deletion(&pending)?;
+        let world = self.registry.worlds.remove(index);
+        let restart_required = self.registry.selected_id == world.id;
+        if restart_required {
+            self.registry.selected_id = self.registry.worlds[0].id.clone();
+        }
+        self.registry.pending_deletions.push(pending.clone());
+        self.save_registry()?;
+        let files_removed = self.remove_world_files(&pending).is_ok();
+        if files_removed {
+            self.registry
+                .pending_deletions
+                .retain(|item| item.id != pending.id);
+            self.save_registry()?;
+        }
+        Ok(DeleteWorldOutcome {
+            restart_required,
+            files_removed,
+        })
+    }
+
+    fn write_world_metadata(&self, world: &WorldEntry) -> Result<()> {
+        let relative = PathBuf::from("worlds").join(&world.id);
+        if !world.save.starts_with(&relative) {
+            return Ok(());
+        }
+        let directory = self.data_dir.join(relative);
+        fs::create_dir_all(&directory).context("creating world directory")?;
+        fs::write(directory.join("world.toml"), toml::to_string_pretty(world)?)
+            .context("writing world metadata")
+    }
+
+    fn apply_pending_deletions(&mut self) {
+        for attempt in 0..40 {
+            let pending = self.registry.pending_deletions.clone();
+            self.registry.pending_deletions = pending
+                .iter()
+                .filter(|item| self.remove_world_files(item).is_err())
+                .cloned()
+                .collect();
+            if self.registry.pending_deletions.is_empty()
+                || self.registry.pending_deletions.len() == pending.len() && attempt == 39
+            {
+                break;
+            }
+            thread::sleep(Duration::from_millis(50));
+        }
+        for pending in &self.registry.pending_deletions {
+            warn!(world = %pending.id, "world files remain pending deletion");
+        }
+    }
+
+    fn remove_world_files(&self, pending: &PendingWorldDeletion) -> Result<()> {
+        self.validate_world_deletion(pending)?;
+        let managed_directory = self.data_dir.join("worlds").join(&pending.id);
+        let save_path = self.data_dir.join(&pending.save);
+        if save_path.starts_with(&managed_directory) {
+            if managed_directory.exists() {
+                fs::remove_dir_all(&managed_directory).context("deleting world directory")?;
+            }
+        } else if save_path.exists() {
+            fs::remove_file(&save_path).context("deleting legacy world save")?;
+        }
+        Ok(())
+    }
+
+    fn validate_world_deletion(&self, pending: &PendingWorldDeletion) -> Result<()> {
+        if pending.save.is_absolute()
+            || pending.save.components().any(|component| {
+                matches!(
+                    component,
+                    PathComponent::ParentDir | PathComponent::RootDir | PathComponent::Prefix(_)
+                )
+            })
+        {
+            anyhow::bail!("refusing to delete a save outside Hypermine's managed data directory");
+        }
+        Ok(())
     }
 
     fn save_registry(&self) -> Result<()> {
@@ -268,6 +401,45 @@ mod tests {
         let reloaded = WorldManager::load(&dirs, PathBuf::from("ignored.save"));
         assert_eq!(reloaded.worlds().len(), 2);
         assert_eq!(reloaded.selected_name(), "Fresh World");
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn managed_worlds_can_be_renamed_and_deleted_safely() {
+        let root = std::env::temp_dir().join(format!(
+            "hypermine-world-management-test-{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&root);
+        let dirs = directories::ProjectDirs::from_path(root.clone()).unwrap();
+        let mut manager = WorldManager::load(&dirs, PathBuf::from("existing.save"));
+        assert!(manager.delete("first-world").is_err());
+        let disposable = manager.create("Disposable").unwrap();
+        manager.rename(&disposable, "Renamed World").unwrap();
+        assert_eq!(manager.selected_name(), "Renamed World");
+        let save_path = manager.selected_save();
+        fs::write(&save_path, b"test save").unwrap();
+        manager.select("first-world").unwrap();
+
+        let outcome = manager.delete(&disposable).unwrap();
+        assert!(!outcome.restart_required);
+        assert!(outcome.files_removed);
+        assert!(!save_path.exists());
+        assert!(!manager.worlds().iter().any(|world| world.id == disposable));
+
+        let external = manager.create("External").unwrap();
+        manager
+            .registry
+            .worlds
+            .iter_mut()
+            .find(|world| world.id == external)
+            .unwrap()
+            .save = root.join("outside.save");
+        assert!(manager.delete(&external).is_err());
+        assert!(manager.worlds().iter().any(|world| world.id == external));
+
+        let reloaded = WorldManager::load(&dirs, PathBuf::from("ignored.save"));
+        assert!(!reloaded.worlds().iter().any(|world| world.id == disposable));
         fs::remove_dir_all(root).unwrap();
     }
 }
