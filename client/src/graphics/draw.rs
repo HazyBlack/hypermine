@@ -2,11 +2,10 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use ash::vk;
-use common::traversal;
 use lahar::Staged;
 use metrics::histogram;
 
-use super::{Base, Fog, Frustum, GltfScene, Meshes, Voxels, fog, voxels};
+use super::{Base, Fog, Frustum, GltfScene, Meshes, Selection, Voxels, fog, voxels};
 use crate::{Asset, Config, Loader, Sim};
 use common::SimConfig;
 use common::proto::{Character, Position};
@@ -41,6 +40,7 @@ pub struct Draw {
     /// Populated after connect, once the voxel configuration is known
     voxels: Option<Voxels>,
     meshes: Meshes,
+    selection: Selection,
     fog: Fog,
 
     /// Reusable storage for barriers that prevent races between image upload and read
@@ -179,6 +179,7 @@ impl Draw {
                 .collect();
 
             let meshes = Meshes::new(&gfx, loader.ctx().mesh_ds_layout);
+            let selection = Selection::new(&gfx);
 
             let fog = Fog::new(&gfx);
 
@@ -217,6 +218,7 @@ impl Draw {
 
                 voxels: None,
                 meshes,
+                selection,
                 fog,
 
                 buffer_barriers: Vec::new(),
@@ -396,10 +398,10 @@ impl Draw {
             );
 
             let nearby_nodes_started = Instant::now();
-            let nearby_nodes = if let Some(sim) = sim.as_deref() {
-                traversal::nearby_nodes(&sim.graph, &view, self.cfg.local_simulation.view_distance)
+            let nearby = if let Some(sim) = sim.as_deref() {
+                sim.nearby_nodes()
             } else {
-                vec![]
+                common::traversal::NearbySnapshot::default()
             };
             histogram!("frame.cpu.nearby_nodes").record(nearby_nodes_started.elapsed());
 
@@ -408,7 +410,7 @@ impl Draw {
                     device,
                     state.voxels.as_mut().unwrap(),
                     sim,
-                    &nearby_nodes,
+                    &nearby,
                     state.post_cmd,
                     frustum,
                 );
@@ -483,7 +485,7 @@ impl Draw {
             }
 
             if let Some(sim) = sim.as_deref() {
-                for (node, transform) in nearby_nodes {
+                for &(node, ref transform) in nearby.nodes.iter() {
                     for &entity in sim.graph_entities.get(node) {
                         if sim.local_character == Some(entity) {
                             // Don't draw ourself
@@ -496,15 +498,43 @@ impl Draw {
                         if let Some(character_model) = self.loader.get(self.character_model)
                             && let Ok(ch) = sim.world.get::<&Character>(entity)
                         {
-                            let transform = na::Matrix4::from(transform * pos.local)
-                                * na::Matrix4::new_scaling(sim.cfg().meters_to_absolute)
-                                * ch.state.orientation.to_homogeneous();
+                            let transform =
+                                na::Matrix4::from(nearby.basis * *transform * pos.local)
+                                    * na::Matrix4::new_scaling(sim.cfg().meters_to_absolute)
+                                    * ch.state.orientation.to_homogeneous();
                             for mesh in &character_model.0 {
                                 self.meshes
                                     .draw(device, state.common_ds, cmd, mesh, &transform);
                             }
                         }
                     }
+                }
+            }
+
+            if let Some(sim) = sim.as_deref() {
+                if sim.admin_pick_selected() {
+                    // Individual overlays make small edits exact. Large operations preview the
+                    // nearest affected blocks while the HUD reports their full dimensions/count.
+                    for preview in sim.admin_pick_preview(512) {
+                        self.selection.draw_voxel(
+                            device,
+                            cmd,
+                            projection.matrix(),
+                            u32::from(sim.cfg.chunk_size),
+                            &preview.chunk_to_view,
+                            preview.coords,
+                        );
+                    }
+                } else if sim.geometry_preview_enabled()
+                    && let Some(hit) = sim.looking_at()
+                {
+                    self.selection.draw(
+                        device,
+                        cmd,
+                        projection.matrix(),
+                        u32::from(sim.cfg.chunk_size),
+                        &hit,
+                    );
                 }
             }
 
@@ -535,10 +565,15 @@ impl Draw {
             device.end_command_buffer(state.post_cmd).unwrap();
 
             // Specify the uniform data before actually submitting the command to transfer it
+            let fog_distance = sim
+                .as_ref()
+                .map_or(self.cfg.local_simulation.fog_distance, |sim| {
+                    sim.cfg.fog_distance
+                });
             state.uniforms.write(Uniforms {
                 view_projection,
                 inverse_projection: *projection.inverse().matrix(),
-                fog_density: fog::density(self.cfg.local_simulation.fog_distance, 1e-3, 5.0),
+                fog_density: fog::density(fog_distance, 1e-3, 5.0),
                 time: self.epoch.elapsed().as_secs_f32().fract(),
             });
 
@@ -599,6 +634,7 @@ impl Drop for Draw {
             device.destroy_descriptor_pool(self.common_descriptor_pool, None);
             device.destroy_pipeline_layout(self.common_pipeline_layout, None);
             self.fog.destroy(device);
+            self.selection.destroy(device);
             self.meshes.destroy(device);
             if let Some(mut voxels) = self.voxels.take() {
                 voxels.destroy(device);

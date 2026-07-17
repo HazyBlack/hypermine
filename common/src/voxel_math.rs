@@ -5,7 +5,7 @@ use serde::{Deserialize, Serialize};
 use crate::dodeca::Side;
 
 /// Represents a particular axis in a voxel grid
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum CoordAxis {
     X = 0,
     Y = 1,
@@ -49,7 +49,7 @@ impl TryFrom<usize> for CoordAxis {
 /// Represents a direction in a particular axis. This struct is meant to be used with a coordinate axis,
 /// so when paired with the X-axis, it represents the postitive X-direction when set to Plus and the
 /// negative X-direction when set to Minus.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum CoordSign {
     Plus = 1,
     Minus = -1,

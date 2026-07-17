@@ -1,3 +1,4 @@
+use crate::dodeca::Vertex;
 use crate::{
     chunk_ray_casting::chunk_ray_cast,
     collision_math::Ray,
@@ -56,6 +57,8 @@ pub fn ray_cast(
                 voxel_coords: hit.voxel_coords,
                 face_axis: hit.face_axis,
                 face_sign: hit.face_sign,
+                chunk_to_view: na::Matrix4::from(transform.inverse())
+                    * na::Matrix4::new_scaling(1.0 / Vertex::dual_to_chunk_factor()),
             })
         });
     }
@@ -83,4 +86,10 @@ pub struct GraphCastHit {
 
     /// The direction along `face_axis` corresponding to the outside of the face that was hit.
     pub face_sign: CoordSign,
+
+    /// Maps normalized chunk coordinates ([0..1]^3) into the coordinate system of the cast ray.
+    ///
+    /// Keeping this with the hit lets transient geometry (selection, damage cracks, tool previews)
+    /// render without searching the potentially very large nearby-node traversal.
+    pub chunk_to_view: na::Matrix4<f32>,
 }

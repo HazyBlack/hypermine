@@ -5,15 +5,20 @@ use crate::{
     voxel_math::Coords, world::Material,
 };
 
+pub const PROTOCOL_VERSION: u32 = 3;
+
 #[derive(Debug, Serialize, Deserialize)]
 pub struct ClientHello {
     pub name: String,
+    #[serde(default)]
+    pub protocol_version: u32,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
 pub struct ServerHello {
     pub character: EntityId,
     pub sim_config: SimConfig,
+    pub protocol_version: u32,
 }
 
 #[derive(Debug, Serialize, Deserialize, Copy, Clone)]
@@ -38,6 +43,7 @@ pub struct StateDelta {
     pub latest_input: u16,
     pub positions: Vec<(EntityId, Position)>,
     pub character_states: Vec<(EntityId, CharacterState)>,
+    pub admin_dig_remaining: Vec<(EntityId, u64)>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -54,6 +60,7 @@ pub struct Spawns {
     pub despawns: Vec<EntityId>,
     pub nodes: Vec<FreshNode>,
     pub block_updates: Vec<BlockUpdate>,
+    pub chunk_edits: Vec<ChunkVoxelEdits>,
     pub voxel_data: Vec<(ChunkId, SerializedVoxelData)>,
     pub inventory_additions: Vec<(EntityId, EntityId)>,
     pub inventory_removals: Vec<(EntityId, EntityId)>,
@@ -72,7 +79,43 @@ pub struct CharacterInput {
     pub movement: na::Vector3<f32>,
     pub jump: bool,
     pub no_clip: bool,
+    #[serde(default)]
+    pub creative: bool,
+    #[serde(default)]
+    pub return_to_spawn: bool,
     pub block_update: Option<BlockUpdate>,
+    #[serde(default)]
+    pub admin_dig: Option<AdminDigRequest>,
+    #[serde(default)]
+    pub cancel_admin_dig: bool,
+    /// Number of authoritative bulk edits received but not yet integrated by this client.
+    #[serde(default)]
+    pub admin_edit_backlog: u32,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+pub struct AdminDigRequest {
+    pub chunk_id: ChunkId,
+    pub coords: Coords,
+    pub face_axis: crate::voxel_math::CoordAxis,
+    pub face_sign: crate::voxel_math::CoordSign,
+    pub width: u16,
+    pub height: u16,
+    pub depth: u16,
+}
+
+impl AdminDigRequest {
+    pub const MAX_AXIS: u16 = 1_000;
+
+    pub fn is_valid(self) -> bool {
+        (1..=Self::MAX_AXIS).contains(&self.width)
+            && (1..=Self::MAX_AXIS).contains(&self.height)
+            && (1..=Self::MAX_AXIS).contains(&self.depth)
+    }
+
+    pub fn block_count(self) -> u64 {
+        u64::from(self.width) * u64::from(self.height) * u64::from(self.depth)
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -81,6 +124,14 @@ pub struct BlockUpdate {
     pub coords: Coords,
     pub new_material: Material,
     pub consumed_entity: Option<EntityId>,
+}
+
+/// Compact authoritative edits for one chunk. Grouping the chunk address prevents large tools
+/// from repeating it for every voxel and lets clients invalidate the chunk mesh only once.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ChunkVoxelEdits {
+    pub chunk_id: ChunkId,
+    pub edits: Vec<(Coords, Material)>,
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
@@ -123,4 +174,91 @@ pub mod connection_error_codes {
     pub const BAD_CLIENT_COMMAND: VarInt = VarInt::from_u32(2);
     pub const NAME_CONFLICT: VarInt = VarInt::from_u32(3);
     pub const CLIENT_CLOSED_CONNECTION: VarInt = VarInt::from_u32(4);
+    pub const INCOMPATIBLE_PROTOCOL: VarInt = VarInt::from_u32(5);
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::{
+        dodeca::Vertex, graph::NodeId, node::ChunkId, voxel_math::Coords, world::Material,
+    };
+
+    use super::{BlockEditBatch, BlockUpdate, ChunkVoxelEdits, VoxelEdit};
+
+    #[test]
+    fn block_edit_batches_have_a_hard_safety_budget() {
+        let mut batch = BlockEditBatch::default();
+        assert!(batch.is_within_budget());
+        batch.edits = vec![
+            VoxelEdit {
+                chunk_id: ChunkId::new(NodeId::ROOT, Vertex::A),
+                coords: Coords([0, 0, 0]),
+                new_material: Material::Dirt,
+            };
+            BlockEditBatch::MAX_EDITS + 1
+        ];
+        assert!(!batch.is_within_budget());
+    }
+
+    #[test]
+    fn chunk_grouping_compacts_large_network_edits() {
+        let chunk_id = ChunkId::new(NodeId::ROOT, Vertex::A);
+        let edits = (0..1_024)
+            .map(|index| {
+                (
+                    Coords([
+                        (index % 12) as u8,
+                        ((index / 12) % 12) as u8,
+                        ((index / 144) % 12) as u8,
+                    ]),
+                    Material::Void,
+                )
+            })
+            .collect::<Vec<_>>();
+        let compact = postcard::to_stdvec(&ChunkVoxelEdits {
+            chunk_id,
+            edits: edits.clone(),
+        })
+        .unwrap();
+        let expanded = postcard::to_stdvec(
+            &edits
+                .into_iter()
+                .map(|(coords, new_material)| BlockUpdate {
+                    chunk_id,
+                    coords,
+                    new_material,
+                    consumed_entity: None,
+                })
+                .collect::<Vec<_>>(),
+        )
+        .unwrap();
+        assert!(
+            compact.len() * 3 < expanded.len() * 2,
+            "compact={} expanded={}",
+            compact.len(),
+            expanded.len()
+        );
+    }
+}
+
+/// A permanent voxel change without inventory-side effects. Geometry tools can collect these into
+/// one validated operation instead of issuing thousands of independent gameplay requests.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct VoxelEdit {
+    pub chunk_id: ChunkId,
+    pub coords: Coords,
+    pub new_material: Material,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct BlockEditBatch {
+    pub edits: Vec<VoxelEdit>,
+}
+
+impl BlockEditBatch {
+    pub const MAX_EDITS: usize = 65_536;
+
+    pub fn is_within_budget(&self) -> bool {
+        self.edits.len() <= Self::MAX_EDITS
+    }
 }

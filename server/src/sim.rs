@@ -4,7 +4,11 @@ use anyhow::Context;
 use common::dodeca::{Side, Vertex};
 use common::math::MIsometry;
 use common::node::VoxelData;
-use common::proto::{BlockUpdate, Inventory, SerializedVoxelData};
+use common::proto::{
+    AdminDigRequest, BlockUpdate, ChunkVoxelEdits, Inventory, SerializedVoxelData,
+};
+use common::voxel_cursor::VoxelCursor;
+use common::voxel_math::CoordSign;
 use common::world::Material;
 use common::{GraphEntities, node::ChunkId};
 use fxhash::{FxHashMap, FxHashSet};
@@ -47,6 +51,7 @@ pub struct Sim {
     /// All chunks in the graph have ever had any block updates applied to them and can no longer be regenerated with worldgen.
     /// This doesn't include chunks that have not been added to the graph yet (See `preloaded_voxel_data`).
     modified_chunks: FxHashSet<ChunkId>,
+    admin_digs: FxHashMap<EntityId, AdminDigJob>,
 }
 
 impl Sim {
@@ -63,6 +68,7 @@ impl Sim {
             dirty_nodes: FxHashSet::default(),
             dirty_voxel_nodes: FxHashSet::default(),
             modified_chunks: FxHashSet::default(),
+            admin_digs: FxHashMap::default(),
             cfg,
         };
 
@@ -467,6 +473,7 @@ impl Sim {
                 .map(|(side, parent)| FreshNode { side, parent })
                 .collect(),
             block_updates: Vec::new(),
+            chunk_edits: Vec::new(),
             voxel_data: Vec::new(),
             inventory_additions: Vec::new(),
             inventory_removals: Vec::new(),
@@ -529,7 +536,9 @@ impl Sim {
             }
         }
 
-        let mut pending_block_updates: Vec<(Entity, BlockUpdate)> = vec![];
+        let mut pending_block_updates: Vec<(Entity, BlockUpdate, bool)> = vec![];
+        let mut pending_admin_digs = Vec::new();
+        let mut admin_edit_backlogs = FxHashMap::default();
 
         // Simulate
         for (entity, node, position, character, input) in self
@@ -543,25 +552,54 @@ impl Sim {
             )>()
             .iter()
         {
-            character_controller::run_character_step(
-                &self.cfg,
-                &self.graph,
-                position,
-                &mut character.state.velocity,
-                &mut character.state.on_ground,
-                input,
-                self.cfg.step_interval.as_secs_f32(),
-            );
+            if input.return_to_spawn && input.creative {
+                return_character_to_spawn(position, &mut character.state);
+            } else {
+                character_controller::run_character_step(
+                    &self.cfg,
+                    &self.graph,
+                    position,
+                    &mut character.state.velocity,
+                    &mut character.state.on_ground,
+                    input,
+                    self.cfg.step_interval.as_secs_f32(),
+                );
+            }
             if let Some(block_update) = input.block_update.clone() {
-                pending_block_updates.push((entity, block_update));
+                pending_block_updates.push((entity, block_update, input.creative));
+            }
+            let id = *self.world.get::<&EntityId>(entity).unwrap();
+            admin_edit_backlogs.insert(id, input.admin_edit_backlog);
+            if !input.creative || input.cancel_admin_dig || input.admin_dig.is_some() {
+                pending_admin_digs.push((
+                    id,
+                    input.admin_dig,
+                    input.cancel_admin_dig,
+                    input.creative,
+                ));
             }
             self.dirty_nodes.insert(*node);
         }
 
-        for (entity, block_update) in pending_block_updates {
+        for (entity, block_update, creative) in pending_block_updates {
             let id = *self.world.get::<&EntityId>(entity).unwrap();
-            self.attempt_block_update(id, block_update);
+            self.attempt_block_update(id, block_update, creative);
         }
+
+        for (id, request, cancel, creative) in pending_admin_digs {
+            if cancel || !creative {
+                self.admin_digs.remove(&id);
+            }
+            if creative && let Some(request) = request.filter(|request| request.is_valid()) {
+                let job = AdminDigJob::new(&mut self.graph, request);
+                self.admin_digs.insert(id, job);
+            }
+        }
+        for input in self.world.query::<&mut CharacterInput>().iter() {
+            input.admin_dig = None;
+            input.cancel_admin_dig = false;
+        }
+        self.process_admin_digs(&admin_edit_backlogs);
 
         self.update_entity_node_ids();
 
@@ -586,6 +624,11 @@ impl Sim {
                 .query::<(&EntityId, &Character)>()
                 .iter()
                 .map(|(&id, ch)| (id, ch.state.clone()))
+                .collect(),
+            admin_dig_remaining: self
+                .admin_digs
+                .iter()
+                .map(|(&id, job)| (id, job.remaining()))
                 .collect(),
         };
 
@@ -680,7 +723,12 @@ impl Sim {
 
     /// Executes the requested block update if the subject is able to do so and
     /// leaves the state of the world unchanged otherwise
-    fn attempt_block_update(&mut self, subject: EntityId, block_update: BlockUpdate) {
+    fn attempt_block_update(
+        &mut self,
+        subject: EntityId,
+        block_update: BlockUpdate,
+        creative: bool,
+    ) {
         let subject_node = *self
             .world
             .get::<&NodeId>(*self.entity_ids.get(&subject).unwrap())
@@ -692,7 +740,7 @@ impl Sim {
             tracing::warn!("Block update received from ungenerated chunk");
             return;
         };
-        if self.cfg.gameplay_enabled {
+        if self.cfg.gameplay_enabled && !creative {
             if block_update.new_material != Material::Void {
                 let Some(consumed_entity_id) = block_update.consumed_entity else {
                     tracing::warn!("Tried to place block without consuming any entities");
@@ -725,6 +773,247 @@ impl Sim {
         self.modified_chunks.insert(block_update.chunk_id);
         self.dirty_voxel_nodes.insert(block_update.chunk_id.node);
         self.accumulated_changes.block_updates.push(block_update);
+    }
+
+    fn process_admin_digs(&mut self, client_backlogs: &FxHashMap<EntityId, u32>) {
+        const EDITS_PER_PLAYER_PER_STEP: usize = 1_024;
+        const PAUSE_AT_CLIENT_BACKLOG: u32 = 16_384;
+        let ids = self.admin_digs.keys().copied().collect::<Vec<_>>();
+        let mut edits_by_chunk: FxHashMap<ChunkId, Vec<_>> = FxHashMap::default();
+        for id in ids {
+            let Some(mut job) = self.admin_digs.remove(&id) else {
+                continue;
+            };
+            if client_backlogs.get(&id).copied().unwrap_or_default() >= PAUSE_AT_CLIENT_BACKLOG {
+                self.admin_digs.insert(id, job);
+                continue;
+            }
+            for _ in 0..EDITS_PER_PLAYER_PER_STEP {
+                let Some(cursor) = job.next(&mut self.graph) else {
+                    break;
+                };
+                let chunk = cursor.chunk;
+                if matches!(self.graph[chunk], Chunk::Fresh) {
+                    if let Some(voxel_data) = self.preloaded_voxel_data.remove(&chunk) {
+                        self.modified_chunks.insert(chunk);
+                        self.graph.populate_chunk(chunk, voxel_data);
+                    } else {
+                        let params = ChunkParams::new(&mut self.graph, chunk);
+                        self.graph.populate_chunk(chunk, params.generate_voxels());
+                    }
+                }
+                if self.graph.get_material(chunk, cursor.coords) == Some(Material::Void) {
+                    continue;
+                }
+                edits_by_chunk
+                    .entry(chunk)
+                    .or_default()
+                    .push((cursor.coords, Material::Void));
+            }
+            if !job.finished() {
+                self.admin_digs.insert(id, job);
+            }
+        }
+        for (chunk_id, edits) in edits_by_chunk {
+            let batch = ChunkVoxelEdits { chunk_id, edits };
+            if self.graph.update_chunk_edits(&batch) > 0 {
+                self.modified_chunks.insert(chunk_id);
+                self.dirty_voxel_nodes.insert(chunk_id.node);
+                self.accumulated_changes.chunk_edits.push(batch);
+            }
+        }
+    }
+}
+
+fn character_spawn_position() -> Position {
+    Position {
+        node: NodeId::ROOT,
+        local: MIsometry::translation_along(&(na::Vector3::y() * 1.4)),
+    }
+}
+
+struct AdminDigJob {
+    dimensions: [u16; 3],
+    plane_origin: VoxelCursor,
+    row_origin: VoxelCursor,
+    cursor: VoxelCursor,
+    indices: [u16; 3],
+    done: bool,
+    processed: u64,
+    total: u64,
+}
+
+impl AdminDigJob {
+    fn new(graph: &mut Graph, request: AdminDigRequest) -> Self {
+        let origin = VoxelCursor::from_hit(
+            request.chunk_id,
+            request.coords,
+            request.face_axis,
+            request.face_sign,
+        );
+        let _ = graph;
+        Self {
+            dimensions: [request.width, request.height, request.depth],
+            plane_origin: origin,
+            row_origin: origin,
+            cursor: origin,
+            indices: [0, 0, 0],
+            done: false,
+            processed: 0,
+            total: request.block_count(),
+        }
+    }
+
+    fn next(&mut self, graph: &mut Graph) -> Option<VoxelCursor> {
+        if self.done {
+            return None;
+        }
+        let result = self.cursor;
+        self.processed += 1;
+        self.indices[0] += 1;
+        if self.indices[0] < self.dimensions[0] {
+            self.cursor = step_offset(
+                self.cursor,
+                graph,
+                0,
+                centered_offset(self.indices[0] - 1),
+                centered_offset(self.indices[0]),
+            );
+            return Some(result);
+        }
+        self.indices[0] = 0;
+        self.indices[1] += 1;
+        if self.indices[1] < self.dimensions[1] {
+            self.row_origin = step_offset(
+                self.row_origin,
+                graph,
+                1,
+                centered_offset(self.indices[1] - 1),
+                centered_offset(self.indices[1]),
+            );
+            self.cursor = self.row_origin;
+            return Some(result);
+        }
+        self.indices[1] = 0;
+        self.indices[2] += 1;
+        if self.indices[2] < self.dimensions[2] {
+            self.plane_origin = self.plane_origin.step_ensuring(graph, 2, CoordSign::Plus);
+            self.row_origin = self.plane_origin;
+            self.cursor = self.plane_origin;
+        } else {
+            self.done = true;
+        }
+        Some(result)
+    }
+
+    fn finished(&self) -> bool {
+        self.done
+    }
+
+    fn remaining(&self) -> u64 {
+        self.total.saturating_sub(self.processed)
+    }
+}
+
+fn centered_offset(index: u16) -> i32 {
+    if index == 0 {
+        0
+    } else if index % 2 == 1 {
+        i32::from(index.div_ceil(2))
+    } else {
+        -i32::from(index / 2)
+    }
+}
+
+fn step_offset(
+    mut cursor: VoxelCursor,
+    graph: &mut Graph,
+    axis: usize,
+    from: i32,
+    to: i32,
+) -> VoxelCursor {
+    let delta = to - from;
+    let sign = if delta >= 0 {
+        CoordSign::Plus
+    } else {
+        CoordSign::Minus
+    };
+    for _ in 0..delta.unsigned_abs() {
+        cursor = cursor.step_ensuring(graph, axis, sign);
+    }
+    cursor
+}
+
+fn return_character_to_spawn(position: &mut Position, state: &mut CharacterState) {
+    *position = character_spawn_position();
+    state.velocity = na::Vector3::zeros();
+    state.on_ground = false;
+    state.orientation = na::UnitQuaternion::identity();
+}
+
+#[cfg(test)]
+mod return_to_spawn_tests {
+    use super::*;
+
+    #[test]
+    fn resets_position_motion_and_orientation() {
+        let mut position = Position::origin();
+        let mut state = CharacterState {
+            velocity: na::Vector3::new(2.0, -3.0, 4.0),
+            on_ground: true,
+            orientation: na::UnitQuaternion::from_axis_angle(&na::Vector3::x_axis(), 1.0),
+        };
+
+        return_character_to_spawn(&mut position, &mut state);
+
+        let spawn = character_spawn_position();
+        assert_eq!(position.node, spawn.node);
+        assert_eq!(position.local, spawn.local);
+        assert_eq!(state.velocity, na::Vector3::zeros());
+        assert!(!state.on_ground);
+        assert_eq!(state.orientation, na::UnitQuaternion::identity());
+    }
+
+    #[test]
+    fn admin_dig_job_visits_requested_volume_near_first() {
+        let mut graph = Graph::new(12);
+        let request = AdminDigRequest {
+            chunk_id: ChunkId::new(NodeId::ROOT, Vertex::A),
+            coords: common::voxel_math::Coords([6, 6, 6]),
+            face_axis: common::voxel_math::CoordAxis::Z,
+            face_sign: CoordSign::Plus,
+            width: 3,
+            height: 3,
+            depth: 2,
+        };
+        let mut job = AdminDigJob::new(&mut graph, request);
+        let first = job.next(&mut graph).unwrap();
+        assert_eq!(first.chunk, request.chunk_id);
+        assert_eq!(first.coords, request.coords);
+        let mut visited = std::collections::HashSet::new();
+        visited.insert((first.chunk, first.coords.0));
+        while let Some(cursor) = job.next(&mut graph) {
+            visited.insert((cursor.chunk, cursor.coords.0));
+        }
+        assert_eq!(visited.len(), request.block_count() as usize);
+        assert_eq!(job.remaining(), 0);
+        assert!(job.finished());
+    }
+
+    #[test]
+    fn maximum_admin_dig_is_stored_compactly() {
+        let mut graph = Graph::new(12);
+        let request = AdminDigRequest {
+            chunk_id: ChunkId::new(NodeId::ROOT, Vertex::A),
+            coords: common::voxel_math::Coords([6, 6, 6]),
+            face_axis: common::voxel_math::CoordAxis::Z,
+            face_sign: CoordSign::Plus,
+            width: 1_000,
+            height: 1_000,
+            depth: 1_000,
+        };
+        let job = AdminDigJob::new(&mut graph, request);
+        assert_eq!(job.remaining(), 1_000_000_000);
     }
 }
 
@@ -765,6 +1054,9 @@ struct AccumulatedChanges {
     /// Block updates that have been applied to the world since the last broadcast
     block_updates: Vec<BlockUpdate>,
 
+    /// Bulk edits grouped by chunk so large tools do not flood clients with repeated addresses.
+    chunk_edits: Vec<ChunkVoxelEdits>,
+
     /// Entities that have been added to an inventory since the last broadcast, where `(a, b)`` represents
     /// entity `b`` being added to inventory `a``
     inventory_additions: Vec<(EntityId, EntityId)>,
@@ -782,6 +1074,7 @@ impl AccumulatedChanges {
         self.spawns.is_empty()
             && self.despawns.is_empty()
             && self.block_updates.is_empty()
+            && self.chunk_edits.is_empty()
             && self.inventory_additions.is_empty()
             && self.inventory_removals.is_empty()
             && self.fresh_nodes.is_empty()
@@ -819,6 +1112,7 @@ impl AccumulatedChanges {
                 })
                 .collect(),
             block_updates: self.block_updates,
+            chunk_edits: self.chunk_edits,
             voxel_data: Vec::new(),
             inventory_additions: self.inventory_additions,
             inventory_removals: self.inventory_removals,

@@ -5,8 +5,10 @@ use common::{
     graph::{Graph, NodeId},
     math::MPoint,
     node::{Chunk, ChunkId, VoxelData},
-    proto::{BlockUpdate, Position},
+    proto::{BlockUpdate, ChunkVoxelEdits, Position},
     traversal,
+    voxel_math::Coords,
+    world::Material,
 };
 use fxhash::FxHashMap;
 use metrics::histogram;
@@ -14,8 +16,11 @@ use tokio::sync::mpsc;
 
 pub struct WorldgenDriver {
     work_queue: WorkQueue,
+    nearby_cache: traversal::NearbyCache,
+    scan_complete: bool,
     /// Voxel data that have been downloaded from the server for chunks not yet introduced to the graph
-    preloaded_block_updates: FxHashMap<ChunkId, Vec<BlockUpdate>>,
+    preloaded_block_updates: FxHashMap<ChunkId, Vec<(Coords, Material)>>,
+    preloaded_block_update_count: usize,
     /// Voxel data that has been fetched from the server but not yet introduced to the graph
     preloaded_voxel_data: FxHashMap<ChunkId, VoxelData>,
 }
@@ -24,16 +29,28 @@ impl WorldgenDriver {
     pub fn new(chunk_load_parallelism: usize) -> Self {
         Self {
             work_queue: WorkQueue::new(chunk_load_parallelism),
+            nearby_cache: traversal::NearbyCache::default(),
+            scan_complete: false,
             preloaded_block_updates: FxHashMap::default(),
+            preloaded_block_update_count: 0,
             preloaded_voxel_data: FxHashMap::default(),
         }
     }
 
-    pub fn drive(&mut self, view: Position, chunk_generation_distance: f32, graph: &mut Graph) {
+    pub fn drive(
+        &mut self,
+        view: Position,
+        chunk_generation_distance: f32,
+        traversal_padding: f32,
+        graph: &mut Graph,
+    ) {
         let drive_worldgen_started = Instant::now();
 
         // Check for chunks that have finished generating
-        while let Some(chunk) = self.work_queue.poll() {
+        for _ in 0..MAX_CHUNK_COMPLETIONS_PER_FRAME {
+            let Some(chunk) = self.work_queue.poll() else {
+                break;
+            };
             self.add_chunk_to_graph(graph, ChunkId::new(chunk.node, chunk.chunk), chunk.voxels);
         }
 
@@ -42,12 +59,31 @@ impl WorldgenDriver {
             // there's no point trying to generate chunks.
             return;
         }
-        let local_to_view = view.local.inverse();
+        self.nearby_cache.rebase_to(view.node);
 
-        traversal::ensure_nearby(graph, &view, chunk_generation_distance);
-        let nearby_nodes = traversal::nearby_nodes(graph, &view, chunk_generation_distance);
+        if self.nearby_cache.needs_refresh(
+            graph,
+            &view,
+            chunk_generation_distance,
+            traversal_padding,
+        ) {
+            // Cache padding must never expand the generated graph. Hyperbolic cell counts grow
+            // exponentially, so even a small accidental radius increase can create large spikes.
+            traversal::ensure_nearby(graph, &view, chunk_generation_distance);
+            self.nearby_cache
+                .refresh(graph, &view, chunk_generation_distance, traversal_padding);
+            self.scan_complete = false;
+        }
+        if self.scan_complete {
+            histogram!("frame.cpu.drive_worldgen").record(drive_worldgen_started.elapsed());
+            return;
+        }
+        let nearby_nodes = self.nearby_cache.shared_nodes();
+        let basis = self.nearby_cache.basis();
+        let local_to_view = view.local.inverse() * basis;
 
-        'nearby_nodes: for &(node, ref node_transform) in &nearby_nodes {
+        let mut completed_scan = true;
+        'nearby_nodes: for &(node, ref node_transform) in nearby_nodes.iter() {
             let node_to_view = local_to_view * node_transform;
             for vertex in Vertex::iter() {
                 let chunk_id = ChunkId::new(node, vertex);
@@ -72,11 +108,17 @@ impl WorldgenDriver {
                     graph[chunk_id] = Chunk::Generating;
                 } else {
                     // No capacity is available in the work queue. Stop trying to prepare chunks to generate.
+                    completed_scan = false;
                     break 'nearby_nodes;
                 }
             }
         }
+        self.scan_complete = completed_scan;
         histogram!("frame.cpu.drive_worldgen").record(drive_worldgen_started.elapsed());
+    }
+
+    pub fn nearby_nodes(&self) -> traversal::NearbySnapshot {
+        self.nearby_cache.snapshot()
     }
 
     /// Adds established voxel data to the graph. This could come from world generation or sent from the server,
@@ -90,21 +132,43 @@ impl WorldgenDriver {
         graph.populate_chunk(chunk_id, voxel_data);
 
         if let Some(block_updates) = self.preloaded_block_updates.remove(&chunk_id) {
-            for block_update in block_updates {
-                // The chunk was just populated, so a block update should always succeed.
-                assert!(graph.update_block(&block_update));
-            }
+            let expected = block_updates.len();
+            self.preloaded_block_update_count =
+                self.preloaded_block_update_count.saturating_sub(expected);
+            let accepted = graph.update_chunk_edits(&ChunkVoxelEdits {
+                chunk_id,
+                edits: block_updates,
+            });
+            assert_eq!(accepted, expected);
         }
     }
 
     pub fn apply_block_update(&mut self, graph: &mut Graph, block_update: BlockUpdate) {
-        if graph.update_block(&block_update) {
+        if graph.contains(block_update.chunk_id.node) && graph.update_block(&block_update) {
             return;
         }
         self.preloaded_block_updates
             .entry(block_update.chunk_id)
             .or_default()
-            .push(block_update);
+            .push((block_update.coords, block_update.new_material));
+        self.preloaded_block_update_count += 1;
+    }
+
+    pub fn apply_chunk_edits(&mut self, graph: &mut Graph, edits: ChunkVoxelEdits) {
+        if graph.contains(edits.chunk_id.node) && graph.update_chunk_edits(&edits) > 0 {
+            return;
+        }
+        self.preloaded_block_update_count = self
+            .preloaded_block_update_count
+            .saturating_add(edits.edits.len());
+        self.preloaded_block_updates
+            .entry(edits.chunk_id)
+            .or_default()
+            .extend(edits.edits);
+    }
+
+    pub fn preloaded_block_update_count(&self) -> usize {
+        self.preloaded_block_update_count
     }
 
     pub fn apply_voxel_data(
@@ -120,6 +184,8 @@ impl WorldgenDriver {
         }
     }
 }
+
+const MAX_CHUNK_COMPLETIONS_PER_FRAME: usize = 32;
 
 struct ChunkDesc {
     node: NodeId,

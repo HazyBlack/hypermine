@@ -119,7 +119,12 @@ mod tests {
             movement: na::Vector3::x(),
             jump: false,
             no_clip: true,
+            creative: false,
+            return_to_spawn: false,
             block_update: None,
+            admin_dig: None,
+            cancel_admin_dig: false,
+            admin_edit_backlog: 0,
         };
 
         let mut pred = PredictedMotion::new(pos());

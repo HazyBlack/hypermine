@@ -1,6 +1,8 @@
-use std::{sync::Arc, thread};
+#![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
-use client::{Config, graphics, metrics, net};
+use std::{cell::RefCell, rc::Rc, sync::Arc, thread};
+
+use client::{Config, SettingsStore, WorldManager, graphics, metrics, net};
 use common::{Anonymize, proto};
 use save::Save;
 
@@ -18,7 +20,13 @@ fn main() {
     let metrics = crate::metrics::init();
 
     let dirs = directories::ProjectDirs::from("", "", "hypermine").unwrap();
-    let config = Arc::new(Config::load(&dirs));
+    let mut config = Config::load(&dirs);
+    let worlds = WorldManager::load(&dirs, config.save.clone());
+    let start_in_title = std::env::var_os("HYPERMINE_AUTOPLAY_ONCE").is_none();
+    config.save = worlds.selected_save();
+    let config = Arc::new(config);
+    let settings = Rc::new(RefCell::new(SettingsStore::load(&dirs)));
+    let worlds = Rc::new(RefCell::new(worlds));
 
     let net = match config.server {
         None => {
@@ -54,7 +62,13 @@ fn main() {
                     .unwrap();
                 let _guard = runtime.enter();
                 server
-                    .connect(proto::ClientHello { name }, backend)
+                    .connect(
+                        proto::ClientHello {
+                            name,
+                            protocol_version: proto::PROTOCOL_VERSION,
+                        },
+                        backend,
+                    )
                     .unwrap();
                 runtime.block_on(server.run().instrument(error_span!("server")));
                 debug!("server thread terminated");
@@ -68,8 +82,11 @@ fn main() {
         config,
         dirs,
         metrics,
+        settings,
+        worlds,
         window: None,
         net: Some(net),
+        start_in_title,
     };
 
     let event_loop = EventLoop::new().unwrap();
@@ -81,14 +98,17 @@ struct App {
     config: Arc<Config>,
     dirs: directories::ProjectDirs,
     metrics: Arc<metrics::Recorder>,
+    settings: Rc<RefCell<SettingsStore>>,
+    worlds: Rc<RefCell<WorldManager>>,
     window: Option<graphics::Window>,
     net: Option<server::Handle>,
+    start_in_title: bool,
 }
 
 impl ApplicationHandler for App {
     fn resumed(&mut self, event_loop: &ActiveEventLoop) {
         // Create the OS window
-        let window = graphics::EarlyWindow::new(event_loop);
+        let window = graphics::EarlyWindow::new(event_loop, &self.settings.borrow().value.video);
         // Initialize Vulkan with the extensions needed to render to the window
         let core = Arc::new(graphics::Core::new(window.required_extensions()));
 
@@ -98,6 +118,9 @@ impl ApplicationHandler for App {
             core.clone(),
             self.config.clone(),
             self.net.take().unwrap(),
+            Rc::clone(&self.settings),
+            Rc::clone(&self.worlds),
+            self.start_in_title,
         );
 
         // Initialize widely-shared graphics resources

@@ -1,12 +1,16 @@
 mod protos;
 
-use std::path::Path;
+use std::{fs, path::Path};
 
 use prost::Message;
 use redb::{Database, ReadableDatabase, ReadableTable, TableDefinition};
 use thiserror::Error;
 
 pub use protos::*;
+
+pub const CURRENT_FORMAT_VERSION: u32 = 1;
+pub const CURRENT_CONTENT_REGISTRY_VERSION: u32 = 1;
+pub const CURRENT_WORLDGEN_VERSION: u32 = 1;
 
 pub struct Save {
     meta: Meta,
@@ -15,8 +19,9 @@ pub struct Save {
 
 impl Save {
     pub fn open(path: &Path, default_chunk_size: u8) -> Result<Self, OpenError> {
+        backup_before_migration(path, CURRENT_FORMAT_VERSION)?;
         let db = Database::create(path).map_err(redb::Error::from)?;
-        let meta = {
+        let mut meta = {
             let tx = db.begin_read().map_err(redb::Error::from)?;
             match tx.open_table(META_TABLE) {
                 Ok(meta) => {
@@ -33,6 +38,9 @@ impl Save {
                     // Must be an empty save file. Initialize the meta record and create the other tables.
                     let defaults = Meta {
                         chunk_size: default_chunk_size.into(),
+                        format_version: CURRENT_FORMAT_VERSION,
+                        content_registry_version: CURRENT_CONTENT_REGISTRY_VERSION,
+                        worldgen_version: CURRENT_WORLDGEN_VERSION,
                     };
                     init_meta_table(&db, &defaults)?;
                     defaults
@@ -40,6 +48,18 @@ impl Save {
                 Err(e) => return Err(OpenError::Db(DbError(Box::new(e.into())))),
             }
         };
+        if meta.format_version > CURRENT_FORMAT_VERSION {
+            return Err(OpenError::FutureVersion {
+                found: meta.format_version,
+                supported: CURRENT_FORMAT_VERSION,
+            });
+        }
+        if meta.format_version == 0 {
+            meta.format_version = CURRENT_FORMAT_VERSION;
+            meta.content_registry_version = CURRENT_CONTENT_REGISTRY_VERSION;
+            meta.worldgen_version = CURRENT_WORLDGEN_VERSION;
+            write_meta_table(&db, &meta)?;
+        }
         Ok(Self { meta, db })
     }
 
@@ -78,6 +98,32 @@ fn init_meta_table(db: &Database, value: &Meta) -> Result<(), DbError> {
     tx.open_table(VOXEL_NODE_TABLE)?;
     tx.open_table(ENTITY_NODE_TABLE)?;
     tx.open_table(CHARACTERS_BY_NAME_TABLE)?;
+    tx.commit()?;
+    Ok(())
+}
+
+fn backup_before_migration(path: &Path, target_version: u32) -> Result<(), OpenError> {
+    if !path.metadata().is_ok_and(|metadata| metadata.len() > 0) {
+        return Ok(());
+    }
+    let mut backup_name = path.as_os_str().to_owned();
+    backup_name.push(format!(".pre-v{target_version}.bak"));
+    let backup = std::path::PathBuf::from(backup_name);
+    if !backup.exists() {
+        fs::copy(path, &backup).map_err(|source| OpenError::BackupFailed { backup, source })?;
+    }
+    Ok(())
+}
+
+fn write_meta_table(db: &Database, value: &Meta) -> Result<(), DbError> {
+    let tx = db.begin_write().map_err(redb::Error::from)?;
+    let mut meta = tx.open_table(META_TABLE)?;
+    let mut cctx = cctx();
+    let mut plain = Vec::new();
+    let mut compressed = Vec::new();
+    prepare(&mut cctx, &mut plain, &mut compressed, value);
+    meta.insert(&[][..], &*compressed)?;
+    drop(meta);
     tx.commit()?;
     Ok(())
 }
@@ -277,6 +323,13 @@ pub enum OpenError {
     DecompressionFailed(&'static str),
     #[error(transparent)]
     Corrupt(#[from] prost::DecodeError),
+    #[error("save format version {found} is newer than supported version {supported}")]
+    FutureVersion { found: u32, supported: u32 },
+    #[error("could not create pre-migration backup at {}: {source}", backup.display())]
+    BackupFailed {
+        backup: std::path::PathBuf,
+        source: std::io::Error,
+    },
 }
 
 impl From<redb::Error> for OpenError {

@@ -33,6 +33,10 @@ impl LocalCharacterController {
         self.orientation
     }
 
+    pub fn reset_orientation(&mut self) {
+        self.orientation = na::UnitQuaternion::identity();
+    }
+
     /// Updates the LocalCharacter based on outside information. Note that the `up` parameter is relative
     /// only to `position`, not the character's orientation.
     pub fn update_position(

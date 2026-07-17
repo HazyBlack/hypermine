@@ -7,6 +7,12 @@ fn persist_meta() {
     let file = tempfile::NamedTempFile::new().unwrap();
     let save = Save::open(file.path(), 12).unwrap();
     assert_eq!(save.meta().chunk_size, 12);
+    assert_eq!(save.meta().format_version, save::CURRENT_FORMAT_VERSION);
+    assert_eq!(
+        save.meta().content_registry_version,
+        save::CURRENT_CONTENT_REGISTRY_VERSION
+    );
+    assert_eq!(save.meta().worldgen_version, save::CURRENT_WORLDGEN_VERSION);
     drop(save);
     let save = Save::open(file.path(), 8).unwrap();
     assert_eq!(save.meta().chunk_size, 12);

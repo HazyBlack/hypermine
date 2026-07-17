@@ -5,6 +5,12 @@ package protos;
 message Meta {
     // Number of voxels along the edge of a chunk
     uint32 chunk_size = 1;
+    // Save container and component schema version. Zero identifies legacy saves.
+    uint32 format_version = 2;
+    // Version of the stable material/content registry used by this world.
+    uint32 content_registry_version = 3;
+    // Version of procedural generation rules used when creating new terrain.
+    uint32 worldgen_version = 4;
 }
 
 message Character {

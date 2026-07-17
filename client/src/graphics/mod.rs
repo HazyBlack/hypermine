@@ -7,8 +7,10 @@ mod fog;
 mod frustum;
 mod gltf_mesh;
 mod gui;
+mod material_icons;
 mod meshes;
 mod png_array;
+mod selection;
 pub mod voxels;
 mod window;
 
@@ -24,6 +26,7 @@ pub use self::{
     gltf_mesh::{GlbFile, GltfScene},
     meshes::{Mesh, Meshes},
     png_array::PngArray,
+    selection::Selection,
     voxels::Voxels,
     window::{EarlyWindow, Window},
 };

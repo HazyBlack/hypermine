@@ -79,6 +79,12 @@ impl Server {
     }
 
     pub fn connect(&mut self, hello: proto::ClientHello, mut backend: HandleBackend) -> Result<()> {
+        anyhow::ensure!(
+            hello.protocol_version == proto::PROTOCOL_VERSION,
+            "client protocol {} is incompatible with server protocol {}",
+            hello.protocol_version,
+            proto::PROTOCOL_VERSION
+        );
         let snapshot = Arc::new(self.sim.snapshot());
         let (id, entity) = self
             .sim
@@ -102,6 +108,7 @@ impl Server {
             .send(Message::Hello(proto::ServerHello {
                 character: id,
                 sim_config: (*self.cfg).clone(),
+                protocol_version: proto::PROTOCOL_VERSION,
             }))
             .unwrap();
 
@@ -271,6 +278,18 @@ impl Server {
     }
 
     fn on_client(&mut self, connection: quinn::Connection, hello: proto::ClientHello) {
+        if hello.protocol_version != proto::PROTOCOL_VERSION {
+            error!(
+                client = hello.protocol_version,
+                server = proto::PROTOCOL_VERSION,
+                "client protocol is incompatible"
+            );
+            connection.close(
+                connection_error_codes::INCOMPATIBLE_PROTOCOL,
+                b"incompatible protocol",
+            );
+            return;
+        }
         let snapshot = Arc::new(self.sim.snapshot());
         let Some((id, entity)) = self.sim.activate_or_spawn_character(&hello) else {
             error!("could not spawn {} due to name conflict", hello.name);
@@ -293,6 +312,7 @@ impl Server {
         let server_hello = proto::ServerHello {
             character: id,
             sim_config: (*self.cfg).clone(),
+            protocol_version: proto::PROTOCOL_VERSION,
         };
         tokio::spawn({
             let connection = connection.clone();

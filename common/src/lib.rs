@@ -28,6 +28,7 @@ pub mod peer_traverser;
 pub mod proto;
 mod sim_config;
 pub mod traversal;
+pub mod voxel_cursor;
 pub mod voxel_math;
 pub mod world;
 pub mod worldgen;

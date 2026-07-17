@@ -1,23 +1,23 @@
-use std::sync::Arc;
 use std::time::Instant;
+use std::{cell::RefCell, process::Command, rc::Rc, sync::Arc};
 use std::{f32, os::raw::c_char};
 
 use ash::{khr, vk};
 use lahar::DedicatedImage;
 use raw_window_handle::{HasDisplayHandle, HasWindowHandle};
 use tracing::{error, info};
-use winit::event::KeyEvent;
+use winit::event::{KeyEvent, MouseScrollDelta};
 use winit::event_loop::ActiveEventLoop;
 use winit::keyboard::{KeyCode, PhysicalKey};
 use winit::{
     dpi::PhysicalSize,
     event::{DeviceEvent, ElementState, MouseButton, WindowEvent},
-    window::{CursorGrabMode, Window as WinitWindow},
+    window::{CursorGrabMode, Fullscreen, Window as WinitWindow},
 };
 
-use super::gui::GuiState;
 use super::{Base, Core, Draw, Frustum};
-use crate::{Config, Sim};
+use super::{gui::GuiState, material_icons::MaterialIcons};
+use crate::{Action, Config, SettingsStore, Sim, WorldManager, settings::VideoSettings};
 
 /// OS window
 pub struct EarlyWindow {
@@ -26,9 +26,13 @@ pub struct EarlyWindow {
 }
 
 impl EarlyWindow {
-    pub fn new(event_loop: &ActiveEventLoop) -> Self {
-        let mut attrs = WinitWindow::default_attributes();
-        attrs.title = "hypermine".into();
+    pub fn new(event_loop: &ActiveEventLoop, video: &VideoSettings) -> Self {
+        let mut attrs = WinitWindow::default_attributes()
+            .with_title("Hypermine")
+            .with_inner_size(PhysicalSize::new(video.width, video.height));
+        if video.fullscreen {
+            attrs = attrs.with_fullscreen(Some(Fullscreen::Borderless(None)));
+        }
         let window = event_loop.create_window(attrs).unwrap();
         Self {
             window,
@@ -59,6 +63,8 @@ pub struct Window {
     gui_state: GuiState,
     yak: yakui::Yakui,
     net: server::Handle,
+    settings: Rc<RefCell<SettingsStore>>,
+    worlds: Rc<RefCell<WorldManager>>,
     input: InputState,
     last_frame: Option<Instant>,
 }
@@ -70,6 +76,9 @@ impl Window {
         core: Arc<Core>,
         config: Arc<Config>,
         net: server::Handle,
+        settings: Rc<RefCell<SettingsStore>>,
+        worlds: Rc<RefCell<WorldManager>>,
+        start_in_title: bool,
     ) -> Self {
         let surface = unsafe {
             ash_window::create_surface(
@@ -82,6 +91,8 @@ impl Window {
             .unwrap()
         };
         let surface_fn = khr::surface::Instance::new(&core.entry, &core.instance);
+        let mut yak = yakui::Yakui::new();
+        let icons = MaterialIcons::load(&mut yak, &config);
 
         Self {
             _core: core,
@@ -93,9 +104,11 @@ impl Window {
             swapchain_needs_update: false,
             draw: None,
             sim: None,
-            gui_state: GuiState::new(),
-            yak: yakui::Yakui::new(),
+            gui_state: GuiState::new(icons, start_in_title),
+            yak,
             net,
+            settings,
+            worlds,
             input: InputState::default(),
             last_frame: None,
         }
@@ -112,10 +125,12 @@ impl Window {
 
     pub fn init_rendering(&mut self, gfx: Arc<Base>) {
         // Allocate the presentable images we'll be rendering to
+        let vsync = self.settings.borrow().value.video.vsync;
         self.swapchain = Some(SwapchainMgr::new(
             self,
             gfx.clone(),
             self.window.inner_size(),
+            vsync,
         ));
         // Construct the core rendering object
         self.draw = Some(Draw::new(gfx, self.config.clone()));
@@ -123,12 +138,16 @@ impl Window {
 
     pub fn handle_device_event(&mut self, event: DeviceEvent) {
         match event {
-            DeviceEvent::MouseMotion { delta } if self.input.mouse_captured => {
+            DeviceEvent::MouseMotion { delta }
+                if self.input.mouse_captured && !self.gui_state.menu_open() =>
+            {
                 if let Some(sim) = self.sim.as_mut() {
-                    const SENSITIVITY: f32 = 2e-3;
+                    let controls = &self.settings.borrow().value.controls;
+                    let sensitivity = 2e-3 * controls.mouse_sensitivity;
+                    let pitch = if controls.invert_y { delta.1 } else { -delta.1 };
                     sim.look(
-                        -delta.0 as f32 * SENSITIVITY,
-                        -delta.1 as f32 * SENSITIVITY,
+                        -delta.0 as f32 * sensitivity,
+                        pitch as f32 * sensitivity,
                         0.0,
                     );
                 }
@@ -140,23 +159,32 @@ impl Window {
     pub fn handle_event(&mut self, event: WindowEvent, event_loop: &ActiveEventLoop) {
         match event {
             WindowEvent::RedrawRequested => {
-                while let Ok(msg) = self.net.incoming.try_recv() {
+                const MAX_NETWORK_MESSAGES_PER_FRAME: usize = 128;
+                const MAX_BULK_EDITS_PER_FRAME: usize = 4_096;
+                for _ in 0..MAX_NETWORK_MESSAGES_PER_FRAME {
+                    let Ok(msg) = self.net.incoming.try_recv() else {
+                        break;
+                    };
                     self.handle_net(msg);
                 }
-
                 if let Some(sim) = self.sim.as_mut() {
-                    let this_frame = Instant::now();
+                    sim.process_pending_chunk_edits(MAX_BULK_EDITS_PER_FRAME);
+                }
+
+                let this_frame = Instant::now();
+                if self.gui_state.menu_open() {
+                    self.input.clear_motion();
+                    self.last_frame = Some(this_frame);
+                } else if let Some(sim) = self.sim.as_mut() {
                     let dt = this_frame - self.last_frame.unwrap_or(this_frame);
                     sim.set_movement_input(self.input.movement());
                     sim.set_jump_held(self.input.jump);
-
                     sim.look(0.0, 0.0, 2.0 * self.input.roll() * dt.as_secs_f32());
-
                     sim.step(dt, &mut self.net);
                     self.last_frame = Some(this_frame);
                 }
 
-                self.draw();
+                self.draw(event_loop);
             }
             WindowEvent::Resized(_) => {
                 // Some environments may not emit the vulkan signals that recommend or
@@ -169,32 +197,58 @@ impl Window {
                 info!("exiting due to closed window");
                 event_loop.exit();
             }
-            WindowEvent::MouseInput {
-                button: MouseButton::Left,
-                state: ElementState::Pressed,
-                ..
-            } => {
-                if self.input.mouse_captured
-                    && let Some(sim) = self.sim.as_mut()
-                {
-                    sim.set_break_block_pressed_true();
+            WindowEvent::CursorMoved { position, .. } if self.gui_state.menu_open() => {
+                self.gui_state
+                    .set_cursor_position([position.x as f32, position.y as f32]);
+                self.yak.handle_event(yakui::event::Event::CursorMoved(Some(
+                    [position.x as f32, position.y as f32].into(),
+                )));
+            }
+            WindowEvent::CursorLeft { .. } if self.gui_state.menu_open() => {
+                self.yak
+                    .handle_event(yakui::event::Event::CursorMoved(None));
+            }
+            WindowEvent::MouseWheel { delta, .. } if self.gui_state.menu_open() => {
+                let delta = match delta {
+                    MouseScrollDelta::LineDelta(x, y) => [x * 40.0, y * 40.0].into(),
+                    MouseScrollDelta::PixelDelta(position) => {
+                        [position.x as f32, position.y as f32].into()
+                    }
+                };
+                self.yak
+                    .handle_event(yakui::event::Event::MouseScroll { delta });
+            }
+            WindowEvent::MouseWheel { delta, .. } => {
+                let vertical = match delta {
+                    MouseScrollDelta::LineDelta(_, y) => y,
+                    MouseScrollDelta::PixelDelta(position) => position.y as f32,
+                };
+                if vertical != 0.0 {
+                    self.cycle_hotbar(if vertical > 0.0 { -1 } else { 1 });
                 }
-                let _ = self
-                    .window
-                    .set_cursor_grab(CursorGrabMode::Confined)
-                    .or_else(|_e| self.window.set_cursor_grab(CursorGrabMode::Locked));
-                self.window.set_cursor_visible(false);
-                self.input.mouse_captured = true;
+            }
+            WindowEvent::MouseInput { button, state, .. } if self.gui_state.menu_open() => {
+                if let Some(button) = yak_mouse_button(button) {
+                    self.yak
+                        .handle_event(yakui::event::Event::MouseButtonChanged {
+                            button,
+                            down: state == ElementState::Pressed,
+                        });
+                }
             }
             WindowEvent::MouseInput {
-                button: MouseButton::Right,
+                button,
                 state: ElementState::Pressed,
                 ..
             } => {
-                if self.input.mouse_captured
-                    && let Some(sim) = self.sim.as_mut()
-                {
-                    sim.set_place_block_pressed_true();
+                if !self.input.mouse_captured {
+                    self.capture_cursor();
+                } else if let Some(sim) = self.sim.as_mut() {
+                    match button {
+                        MouseButton::Left => sim.set_break_block_pressed_true(),
+                        MouseButton::Right => sim.set_place_block_pressed_true(),
+                        _ => {}
+                    }
                 }
             }
             WindowEvent::KeyboardInput {
@@ -202,92 +256,201 @@ impl Window {
                     KeyEvent {
                         state,
                         physical_key: PhysicalKey::Code(key),
+                        text,
+                        repeat,
                         ..
                     },
                 ..
-            } => match key {
-                KeyCode::KeyW => {
-                    self.input.forward = state == ElementState::Pressed;
+            } => {
+                let pressed = state == ElementState::Pressed;
+                if key == KeyCode::Escape && pressed && !repeat {
+                    if self.gui_state.inventory_open() {
+                        let world_id = self.worlds.borrow().selected_id().to_owned();
+                        self.gui_state.close_inventory(
+                            self.sim.as_mut(),
+                            &mut self.settings.borrow_mut(),
+                            &world_id,
+                        );
+                    } else {
+                        self.gui_state.handle_escape();
+                    }
+                    if self.gui_state.menu_open() {
+                        self.release_cursor();
+                    } else {
+                        self.capture_cursor();
+                    }
+                    return;
                 }
-                KeyCode::KeyA => {
-                    self.input.left = state == ElementState::Pressed;
-                }
-                KeyCode::KeyS => {
-                    self.input.back = state == ElementState::Pressed;
-                }
-                KeyCode::KeyD => {
-                    self.input.right = state == ElementState::Pressed;
-                }
-                KeyCode::KeyQ => {
-                    self.input.anticlockwise = state == ElementState::Pressed;
-                }
-                KeyCode::KeyE => {
-                    self.input.clockwise = state == ElementState::Pressed;
-                }
-                KeyCode::KeyR => {
-                    self.input.up = state == ElementState::Pressed;
-                }
-                KeyCode::KeyF => {
-                    self.input.down = state == ElementState::Pressed;
-                }
-                KeyCode::Space => {
-                    if let Some(sim) = self.sim.as_mut() {
-                        if !self.input.jump && state == ElementState::Pressed {
-                            sim.set_jump_pressed_true();
+
+                if self.gui_state.menu_open() {
+                    if self.gui_state.is_rebinding() && pressed && !repeat {
+                        self.gui_state
+                            .capture_binding(format!("{key:?}"), &mut self.settings.borrow_mut());
+                        return;
+                    }
+                    if let Some(key) = yak_key(key) {
+                        self.yak
+                            .handle_event(yakui::event::Event::KeyChanged { key, down: pressed });
+                    }
+                    if pressed && let Some(text) = text {
+                        for character in text.chars().filter(|character| !character.is_control()) {
+                            self.yak
+                                .handle_event(yakui::event::Event::TextInput(character));
                         }
-                        self.input.jump = state == ElementState::Pressed;
                     }
+                    return;
                 }
-                KeyCode::KeyV if state == ElementState::Pressed => {
-                    if let Some(sim) = self.sim.as_mut() {
-                        sim.toggle_no_clip();
-                    }
-                }
-                KeyCode::F1 if state == ElementState::Pressed => {
-                    self.gui_state.toggle_gui();
-                }
-                KeyCode::Escape => {
-                    let _ = self.window.set_cursor_grab(CursorGrabMode::None);
-                    self.window.set_cursor_visible(true);
-                    self.input.mouse_captured = false;
-                }
-                KeyCode::Minus => {
-                    if state == ElementState::Pressed
-                        && let Some(sim) = self.sim.as_mut()
-                    {
-                        sim.prev_material();
-                    }
-                }
-                KeyCode::Equal => {
-                    if state == ElementState::Pressed
-                        && let Some(sim) = self.sim.as_mut()
-                    {
-                        sim.next_material();
-                    }
-                }
-                KeyCode::KeyG => {
-                    if let Some(sim) = self.sim.as_mut() {
-                        sim.pick_material();
-                    }
-                }
-                _ => {
-                    if let Some(material_idx) = number_key_to_index(key)
-                        && state == ElementState::Pressed
-                        && let Some(sim) = self.sim.as_mut()
-                    {
-                        sim.select_material(material_idx);
-                    }
-                }
-            },
-            WindowEvent::Focused(focused) => {
-                if !focused {
-                    let _ = self.window.set_cursor_grab(CursorGrabMode::None);
-                    self.window.set_cursor_visible(true);
-                    self.input.mouse_captured = false;
-                }
+
+                self.handle_bound_key(&format!("{key:?}"), pressed, repeat);
+            }
+            WindowEvent::Focused(false) => {
+                self.release_cursor();
+                self.input.clear_motion();
             }
             _ => {}
         }
+    }
+
+    fn handle_bound_key(&mut self, key: &str, pressed: bool, repeat: bool) {
+        let controls = self.settings.borrow().value.controls.clone();
+        let bound = |action| controls.binding(action) == key;
+        if bound(Action::Forward) {
+            self.input.forward = pressed;
+        }
+        if bound(Action::Backward) {
+            self.input.back = pressed;
+        }
+        if bound(Action::Left) {
+            self.input.left = pressed;
+        }
+        if bound(Action::Right) {
+            self.input.right = pressed;
+        }
+        if bound(Action::MoveUp) {
+            self.input.up = pressed;
+        }
+        if bound(Action::MoveDown) {
+            self.input.down = pressed;
+        }
+        if bound(Action::RollLeft) {
+            self.input.anticlockwise = pressed;
+        }
+        if bound(Action::RollRight) {
+            self.input.clockwise = pressed;
+        }
+        if bound(Action::Jump) {
+            if pressed
+                && !self.input.jump
+                && let Some(sim) = self.sim.as_mut()
+            {
+                sim.set_jump_pressed_true();
+            }
+            self.input.jump = pressed;
+        }
+
+        if !pressed || repeat {
+            return;
+        }
+        if bound(Action::ToggleNoClip)
+            && let Some(sim) = self.sim.as_mut()
+        {
+            sim.toggle_no_clip();
+        }
+        if bound(Action::ToggleHud) {
+            self.gui_state.toggle_hud();
+        }
+        if bound(Action::PlayerNavigation) {
+            self.gui_state.toggle_navigation();
+        }
+        if bound(Action::DeveloperOverlay) {
+            self.gui_state.toggle_debug();
+        }
+        if bound(Action::GuideHome) {
+            self.gui_state.toggle_guide_home();
+        }
+        if bound(Action::GeometryPreview)
+            && let Some(sim) = self.sim.as_mut()
+        {
+            sim.toggle_geometry_preview();
+        }
+        if bound(Action::OpenInventory) {
+            self.open_inventory();
+            return;
+        }
+        if bound(Action::PreviousMaterial) {
+            self.cycle_hotbar(-1);
+        }
+        if bound(Action::NextMaterial) {
+            self.cycle_hotbar(1);
+        }
+        if bound(Action::PickMaterial)
+            && let Some(material) = self.sim.as_ref().and_then(Sim::looked_at_material)
+        {
+            self.pick_material(material);
+        }
+        for action in Action::ALL {
+            if bound(action)
+                && let Some(index) = action.material_index()
+            {
+                self.select_hotbar_slot(index);
+            }
+        }
+    }
+
+    fn open_inventory(&mut self) {
+        let world_id = self.worlds.borrow().selected_id().to_owned();
+        self.gui_state.open_inventory(
+            self.sim.as_mut(),
+            &mut self.settings.borrow_mut(),
+            &world_id,
+        );
+        self.release_cursor();
+        self.input.clear_motion();
+    }
+
+    fn select_hotbar_slot(&mut self, index: usize) {
+        let world_id = self.worlds.borrow().selected_id().to_owned();
+        self.gui_state.select_hotbar_slot(
+            index,
+            self.sim.as_mut(),
+            &mut self.settings.borrow_mut(),
+            &world_id,
+        );
+    }
+
+    fn cycle_hotbar(&mut self, delta: i32) {
+        let world_id = self.worlds.borrow().selected_id().to_owned();
+        self.gui_state.cycle_hotbar(
+            delta,
+            self.sim.as_mut(),
+            &mut self.settings.borrow_mut(),
+            &world_id,
+        );
+    }
+
+    fn pick_material(&mut self, material: common::world::Material) {
+        let world_id = self.worlds.borrow().selected_id().to_owned();
+        self.gui_state.pick_material(
+            material,
+            self.sim.as_mut(),
+            &mut self.settings.borrow_mut(),
+            &world_id,
+        );
+    }
+
+    fn release_cursor(&mut self) {
+        let _ = self.window.set_cursor_grab(CursorGrabMode::None);
+        self.window.set_cursor_visible(true);
+        self.input.mouse_captured = false;
+    }
+
+    fn capture_cursor(&mut self) {
+        let _ = self
+            .window
+            .set_cursor_grab(CursorGrabMode::Confined)
+            .or_else(|_| self.window.set_cursor_grab(CursorGrabMode::Locked));
+        self.window.set_cursor_visible(false);
+        self.input.mouse_captured = true;
     }
 
     fn handle_net(&mut self, msg: server::Message) {
@@ -296,11 +459,12 @@ impl Window {
                 error!("connection lost: {}", e);
             }
             server::Message::Hello(msg) => {
-                let sim = Sim::new(
+                let mut sim = Sim::new(
                     msg.sim_config,
                     self.config.chunk_load_parallelism as usize,
                     msg.character,
                 );
+                apply_video_to_sim(&mut sim, &self.settings.borrow().value.video);
                 if let Some(draw) = self.draw.as_mut() {
                     draw.configure(sim.cfg());
                 }
@@ -317,7 +481,56 @@ impl Window {
     }
 
     /// Draw a new frame
-    fn draw(&mut self) {
+    fn draw(&mut self, event_loop: &ActiveEventLoop) {
+        let initial_extent = self.swapchain.as_ref().unwrap().state.extent;
+        let video = self.settings.borrow().value.video.clone();
+        self.yak.set_scale_factor(video.ui_scale);
+        self.yak
+            .set_surface_size([initial_extent.width as f32, initial_extent.height as f32].into());
+        self.yak
+            .set_unscaled_viewport(yakui::geometry::Rect::from_pos_size(
+                Default::default(),
+                [initial_extent.width as f32, initial_extent.height as f32].into(),
+            ));
+        let menu_was_open = self.gui_state.menu_open();
+        self.yak.start();
+        let gui_action = self.gui_state.run(
+            self.sim.as_mut(),
+            &mut self.settings.borrow_mut(),
+            &mut self.worlds.borrow_mut(),
+            [initial_extent.width as f32, initial_extent.height as f32],
+        );
+        self.yak.finish();
+
+        if gui_action.video_changed {
+            self.apply_video_settings(gui_action.display_mode_changed);
+        }
+        if menu_was_open && !self.gui_state.menu_open() {
+            self.capture_cursor();
+        }
+        if gui_action.quit {
+            event_loop.exit();
+            return;
+        }
+        if gui_action.restart {
+            match std::env::current_exe().and_then(|exe| {
+                let mut command = Command::new(exe);
+                if gui_action.play_after_restart {
+                    command.env("HYPERMINE_AUTOPLAY_ONCE", "1");
+                } else {
+                    command.env_remove("HYPERMINE_AUTOPLAY_ONCE");
+                }
+                if let Ok(directory) = std::env::current_dir() {
+                    command.current_dir(directory);
+                }
+                command.spawn().map(|_| ())
+            }) {
+                Ok(()) => event_loop.exit(),
+                Err(error) => error!("couldn't restart for world switch: {error}"),
+            }
+            return;
+        }
+
         let swapchain = self.swapchain.as_mut().unwrap();
         let draw = self.draw.as_mut().unwrap();
         unsafe {
@@ -330,7 +543,12 @@ impl Window {
                     // Wait for all in-flight frames to complete so we don't have a use-after-free
                     draw.wait_idle();
                     // Recreate the swapchain at a new size (or whatever)
-                    swapchain.update(&self.surface_fn, self.surface, self.window.inner_size());
+                    swapchain.update(
+                        &self.surface_fn,
+                        self.surface,
+                        self.window.inner_size(),
+                        self.settings.borrow().value.video.vsync,
+                    );
                     self.swapchain_needs_update = false;
                 }
                 match swapchain.acquire_next_image(draw.image_acquired()) {
@@ -349,20 +567,8 @@ impl Window {
             let extent = swapchain.state.extent;
             let aspect_ratio = extent.width as f32 / extent.height as f32;
             let frame = &swapchain.state.frames[frame_id as usize];
-            let frustum = Frustum::from_vfov(f32::consts::FRAC_PI_4 * 1.2, aspect_ratio);
-            // Render the GUI
-            self.yak
-                .set_surface_size([extent.width as f32, extent.height as f32].into());
-            self.yak
-                .set_unscaled_viewport(yakui::geometry::Rect::from_pos_size(
-                    Default::default(),
-                    [extent.width as f32, extent.height as f32].into(),
-                ));
-            self.yak.start();
-            if let Some(sim) = self.sim.as_ref() {
-                self.gui_state.run(sim);
-            }
-            self.yak.finish();
+            let vfov = self.settings.borrow().value.video.fov_degrees.to_radians();
+            let frustum = Frustum::from_vfov(vfov, aspect_ratio);
             // Render the frame
             draw.draw(
                 self.sim.as_mut(),
@@ -383,22 +589,100 @@ impl Window {
             };
         }
     }
+
+    fn apply_video_settings(&mut self, display_mode_changed: bool) {
+        let video = self.settings.borrow().value.video.clone();
+        apply_video_to_sim_option(self.sim.as_mut(), &video);
+        if display_mode_changed {
+            self.window.set_fullscreen(if video.fullscreen {
+                Some(Fullscreen::Borderless(self.window.current_monitor()))
+            } else {
+                None
+            });
+            if !video.fullscreen {
+                let _ = self
+                    .window
+                    .request_inner_size(PhysicalSize::new(video.width, video.height));
+            }
+        }
+        self.swapchain_needs_update = true;
+    }
 }
 
-fn number_key_to_index(key: KeyCode) -> Option<usize> {
-    match key {
-        KeyCode::Digit1 => Some(0),
-        KeyCode::Digit2 => Some(1),
-        KeyCode::Digit3 => Some(2),
-        KeyCode::Digit4 => Some(3),
-        KeyCode::Digit5 => Some(4),
-        KeyCode::Digit6 => Some(5),
-        KeyCode::Digit7 => Some(6),
-        KeyCode::Digit8 => Some(7),
-        KeyCode::Digit9 => Some(8),
-        KeyCode::Digit0 => Some(9),
+fn apply_video_to_sim_option(sim: Option<&mut Sim>, video: &VideoSettings) {
+    if let Some(sim) = sim {
+        apply_video_to_sim(sim, video);
+    }
+}
+
+fn apply_video_to_sim(sim: &mut Sim, video: &VideoSettings) {
+    let scale = sim.cfg.meters_to_absolute;
+    sim.cfg.view_distance = video.view_distance_m * scale;
+    sim.cfg.chunk_generation_distance = (video.view_distance_m - 10.0).max(25.0) * scale;
+    sim.cfg.fog_distance = (video.view_distance_m + 15.0) * scale;
+}
+
+fn yak_mouse_button(button: MouseButton) -> Option<yakui::input::MouseButton> {
+    match button {
+        MouseButton::Left => Some(yakui::input::MouseButton::One),
+        MouseButton::Right => Some(yakui::input::MouseButton::Two),
+        MouseButton::Middle => Some(yakui::input::MouseButton::Three),
         _ => None,
     }
+}
+
+fn yak_key(key: KeyCode) -> Option<yakui::input::KeyCode> {
+    use yakui::input::KeyCode as Yak;
+    Some(match key {
+        KeyCode::KeyA => Yak::KeyA,
+        KeyCode::KeyB => Yak::KeyB,
+        KeyCode::KeyC => Yak::KeyC,
+        KeyCode::KeyD => Yak::KeyD,
+        KeyCode::KeyE => Yak::KeyE,
+        KeyCode::KeyF => Yak::KeyF,
+        KeyCode::KeyG => Yak::KeyG,
+        KeyCode::KeyH => Yak::KeyH,
+        KeyCode::KeyI => Yak::KeyI,
+        KeyCode::KeyJ => Yak::KeyJ,
+        KeyCode::KeyK => Yak::KeyK,
+        KeyCode::KeyL => Yak::KeyL,
+        KeyCode::KeyM => Yak::KeyM,
+        KeyCode::KeyN => Yak::KeyN,
+        KeyCode::KeyO => Yak::KeyO,
+        KeyCode::KeyP => Yak::KeyP,
+        KeyCode::KeyQ => Yak::KeyQ,
+        KeyCode::KeyR => Yak::KeyR,
+        KeyCode::KeyS => Yak::KeyS,
+        KeyCode::KeyT => Yak::KeyT,
+        KeyCode::KeyU => Yak::KeyU,
+        KeyCode::KeyV => Yak::KeyV,
+        KeyCode::KeyW => Yak::KeyW,
+        KeyCode::KeyX => Yak::KeyX,
+        KeyCode::KeyY => Yak::KeyY,
+        KeyCode::KeyZ => Yak::KeyZ,
+        KeyCode::Digit0 => Yak::Digit0,
+        KeyCode::Digit1 => Yak::Digit1,
+        KeyCode::Digit2 => Yak::Digit2,
+        KeyCode::Digit3 => Yak::Digit3,
+        KeyCode::Digit4 => Yak::Digit4,
+        KeyCode::Digit5 => Yak::Digit5,
+        KeyCode::Digit6 => Yak::Digit6,
+        KeyCode::Digit7 => Yak::Digit7,
+        KeyCode::Digit8 => Yak::Digit8,
+        KeyCode::Digit9 => Yak::Digit9,
+        KeyCode::Space => Yak::Space,
+        KeyCode::Enter => Yak::Enter,
+        KeyCode::Backspace => Yak::Backspace,
+        KeyCode::Delete => Yak::Delete,
+        KeyCode::ArrowLeft => Yak::ArrowLeft,
+        KeyCode::ArrowRight => Yak::ArrowRight,
+        KeyCode::ArrowUp => Yak::ArrowUp,
+        KeyCode::ArrowDown => Yak::ArrowDown,
+        KeyCode::Home => Yak::Home,
+        KeyCode::End => Yak::End,
+        KeyCode::Tab => Yak::Tab,
+        _ => return None,
+    })
 }
 
 impl Drop for Window {
@@ -418,7 +702,7 @@ struct SwapchainMgr {
 
 impl SwapchainMgr {
     /// Construct a swapchain manager for a certain window
-    fn new(window: &Window, gfx: Arc<Base>, fallback_size: PhysicalSize<u32>) -> Self {
+    fn new(window: &Window, gfx: Arc<Base>, fallback_size: PhysicalSize<u32>, vsync: bool) -> Self {
         let device = &*gfx.device;
         let swapchain_fn = khr::swapchain::Device::new(&gfx.core.instance, device);
         let surface_formats = unsafe {
@@ -453,7 +737,10 @@ impl SwapchainMgr {
                     window.surface,
                     desired_format,
                     vk::SwapchainKHR::null(),
-                    fallback_size,
+                    SwapchainOptions {
+                        fallback_size,
+                        vsync,
+                    },
                 )
             },
             format: desired_format,
@@ -469,6 +756,7 @@ impl SwapchainMgr {
         surface_fn: &khr::surface::Instance,
         surface: vk::SurfaceKHR,
         fallback_size: PhysicalSize<u32>,
+        vsync: bool,
     ) {
         unsafe {
             self.state = SwapchainState::new(
@@ -478,7 +766,10 @@ impl SwapchainMgr {
                 surface,
                 self.format,
                 self.state.handle,
-                fallback_size,
+                SwapchainOptions {
+                    fallback_size,
+                    vsync,
+                },
             );
         }
     }
@@ -518,6 +809,11 @@ struct SwapchainState {
     frames: Vec<Frame>,
 }
 
+struct SwapchainOptions {
+    fallback_size: PhysicalSize<u32>,
+    vsync: bool,
+}
+
 impl SwapchainState {
     unsafe fn new(
         surface_fn: &khr::surface::Instance,
@@ -526,7 +822,7 @@ impl SwapchainState {
         surface: vk::SurfaceKHR,
         format: vk::SurfaceFormatKHR,
         old: vk::SwapchainKHR,
-        fallback_size: PhysicalSize<u32>,
+        options: SwapchainOptions,
     ) -> Self {
         unsafe {
             let device = &*gfx.device;
@@ -537,8 +833,8 @@ impl SwapchainState {
             let extent = match surface_capabilities.current_extent.width {
                 // If Vulkan doesn't know, winit probably does. Known to apply at least to Wayland.
                 std::u32::MAX => vk::Extent2D {
-                    width: fallback_size.width,
-                    height: fallback_size.height,
+                    width: options.fallback_size.width,
+                    height: options.fallback_size.height,
                 },
                 _ => surface_capabilities.current_extent,
             };
@@ -553,11 +849,15 @@ impl SwapchainState {
             let present_modes = surface_fn
                 .get_physical_device_surface_present_modes(gfx.physical, surface)
                 .unwrap();
-            let present_mode = present_modes
-                .iter()
-                .cloned()
-                .find(|&mode| mode == vk::PresentModeKHR::MAILBOX)
-                .unwrap_or(vk::PresentModeKHR::FIFO);
+            let present_mode = if options.vsync {
+                vk::PresentModeKHR::FIFO
+            } else {
+                present_modes
+                    .iter()
+                    .cloned()
+                    .find(|&mode| mode == vk::PresentModeKHR::MAILBOX)
+                    .unwrap_or(vk::PresentModeKHR::FIFO)
+            };
 
             let image_count = if surface_capabilities.max_image_count > 0 {
                 surface_capabilities
@@ -724,6 +1024,18 @@ struct InputState {
 }
 
 impl InputState {
+    fn clear_motion(&mut self) {
+        self.forward = false;
+        self.back = false;
+        self.left = false;
+        self.right = false;
+        self.up = false;
+        self.down = false;
+        self.jump = false;
+        self.clockwise = false;
+        self.anticlockwise = false;
+    }
+
     fn movement(&self) -> na::Vector3<f32> {
         na::Vector3::new(
             self.right as u8 as f32 - self.left as u8 as f32,

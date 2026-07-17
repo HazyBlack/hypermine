@@ -18,21 +18,22 @@ use crate::{
 use common::{
     dodeca::{self, Vertex},
     graph::NodeId,
-    math::{MIsometry, MPoint},
+    math::MPoint,
     node::{Chunk, ChunkId, VoxelData},
+    traversal::NearbySnapshot,
 };
 
 use surface::Surface;
 use surface_extraction::{DrawBuffer, ExtractTask, ScratchBuffer, SurfaceExtraction};
 
 pub struct Voxels {
-    config: Arc<Config>,
     surface_extraction: SurfaceExtraction,
     extraction_scratch: ScratchBuffer,
     surfaces: DrawBuffer,
     states: LruSlab<SurfaceState>,
     draw: Surface,
     max_chunks: u32,
+    max_extractions_per_frame: usize,
 }
 
 impl Voxels {
@@ -57,20 +58,21 @@ impl Voxels {
         let surfaces = DrawBuffer::new(gfx, max_chunks, dimension);
         let draw = Surface::new(gfx, loader, &surfaces);
         let surface_extraction = SurfaceExtraction::new(gfx);
+        let max_extractions_per_frame = config.chunk_load_parallelism.min(32) as usize;
         let extraction_scratch = surface_extraction::ScratchBuffer::new(
             gfx,
             &surface_extraction,
-            config.chunk_load_parallelism * frames,
+            max_extractions_per_frame as u32 * frames,
             dimension,
         );
         Self {
-            config,
             surface_extraction,
             extraction_scratch,
             surfaces,
             states: LruSlab::with_capacity(max_chunks),
             draw,
             max_chunks,
+            max_extractions_per_frame,
         }
     }
 
@@ -83,7 +85,7 @@ impl Voxels {
         device: &Device,
         frame: &mut Frame,
         sim: &mut Sim,
-        nearby_nodes: &[(NodeId, MIsometry<f32>)],
+        nearby: &NearbySnapshot,
         cmd: vk::CommandBuffer,
         frustum: &Frustum,
     ) {
@@ -104,11 +106,16 @@ impl Voxels {
         }
         let node_scan_started = Instant::now();
         let frustum_planes = frustum.planes();
-        let local_to_view = view.local.inverse();
+        let local_to_view = view.local.inverse() * nearby.basis;
+        let max_node_cosh_distance =
+            (sim.cfg.view_distance + dodeca::BOUNDING_SPHERE_RADIUS).cosh();
         let mut extractions = Vec::new();
-        for &(node, ref node_transform) in nearby_nodes {
+        for &(node, ref node_transform) in nearby.nodes.iter() {
             let node_to_view = local_to_view * node_transform;
             let origin = node_to_view * MPoint::origin();
+            if origin.w > max_node_cosh_distance {
+                continue;
+            }
             if !frustum_planes.contain(&origin, dodeca::BOUNDING_SPHERE_RADIUS) {
                 // Don't bother generating or drawing chunks from nodes that are wholly outside the
                 // frustum.
@@ -135,11 +142,11 @@ impl Voxels {
                     frame.drawn.push(slot);
                     // Transfer transform
                     frame.surface.transforms_mut()[slot as usize] =
-                        na::Matrix4::from(*node_transform) * vertex.chunk_to_node();
+                        na::Matrix4::from(nearby.basis * *node_transform) * vertex.chunk_to_node();
                 }
                 if let (None, &VoxelData::Dense(ref data)) = (&surface, voxels) {
                     // Extract a surface so it can be drawn in future frames
-                    if frame.extracted.len() == self.config.chunk_load_parallelism as usize {
+                    if frame.extracted.len() == self.max_extractions_per_frame {
                         continue;
                     }
                     let removed = if self.states.len() == self.max_chunks {

@@ -1,4 +1,4 @@
-use std::collections::VecDeque;
+use std::{collections::VecDeque, sync::Arc};
 
 use fxhash::FxHashSet;
 
@@ -95,6 +95,119 @@ pub fn nearby_nodes(
     }
 
     result
+}
+
+/// Reuses the expensive nearby-node traversal while the player remains close to the point where
+/// it was computed. The cached query includes `padding` beyond the requested distance, so every
+/// node that can enter the requested radius remains available until the anchor has moved by that
+/// amount.
+pub struct NearbyCache {
+    anchor: Option<NearbyCacheAnchor>,
+    nodes: Arc<Vec<(NodeId, MIsometry<f32>)>>,
+    /// Converts cached node transforms into the current reference cell without rewriting the
+    /// entire cached traversal when the player crosses a cell boundary.
+    basis: MIsometry<f32>,
+}
+
+#[derive(Clone)]
+pub struct NearbySnapshot {
+    pub nodes: Arc<Vec<(NodeId, MIsometry<f32>)>>,
+    pub basis: MIsometry<f32>,
+}
+
+impl Default for NearbySnapshot {
+    fn default() -> Self {
+        Self {
+            nodes: Arc::default(),
+            basis: MIsometry::identity(),
+        }
+    }
+}
+
+struct NearbyCacheAnchor {
+    node: NodeId,
+    point: MPoint<f32>,
+    distance: f32,
+    padding: f32,
+    graph_len: u32,
+}
+
+impl NearbyCache {
+    pub fn rebase_to(&mut self, node: NodeId) -> bool {
+        let Some(anchor) = &mut self.anchor else {
+            return false;
+        };
+        if anchor.node == node {
+            return true;
+        }
+        let Some((_, cached_transform)) = self.nodes.iter().find(|(id, _)| *id == node) else {
+            return false;
+        };
+        let current_transform = self.basis * *cached_transform;
+        let rebase = current_transform.inverse();
+        self.basis = rebase * self.basis;
+        anchor.point = rebase * anchor.point;
+        anchor.node = node;
+        true
+    }
+
+    pub fn needs_refresh(
+        &self,
+        graph: &Graph,
+        start: &Position,
+        distance: f32,
+        padding: f32,
+    ) -> bool {
+        let Some(anchor) = &self.anchor else {
+            return true;
+        };
+        anchor.node != start.node
+            || anchor.graph_len != graph.len()
+            || anchor.distance != distance
+            || anchor.padding != padding
+            || anchor.point.distance(&(start.local * MPoint::origin())) >= padding
+    }
+
+    pub fn refresh(&mut self, graph: &Graph, start: &Position, distance: f32, padding: f32) {
+        self.nodes = Arc::new(nearby_nodes(graph, start, distance + padding));
+        self.basis = MIsometry::identity();
+        self.anchor = Some(NearbyCacheAnchor {
+            node: start.node,
+            point: start.local * MPoint::origin(),
+            distance,
+            padding,
+            graph_len: graph.len(),
+        });
+    }
+
+    pub fn nodes(&self) -> &[(NodeId, MIsometry<f32>)] {
+        &self.nodes
+    }
+
+    pub fn shared_nodes(&self) -> Arc<Vec<(NodeId, MIsometry<f32>)>> {
+        Arc::clone(&self.nodes)
+    }
+
+    pub fn basis(&self) -> MIsometry<f32> {
+        self.basis
+    }
+
+    pub fn snapshot(&self) -> NearbySnapshot {
+        NearbySnapshot {
+            nodes: self.shared_nodes(),
+            basis: self.basis,
+        }
+    }
+}
+
+impl Default for NearbyCache {
+    fn default() -> Self {
+        Self {
+            anchor: None,
+            nodes: Arc::default(),
+            basis: MIsometry::identity(),
+        }
+    }
 }
 
 pub struct RayTraverser<'a> {
@@ -242,5 +355,50 @@ mod tests {
 
         let nodes = nearby_nodes(&graph, &Position::origin(), 6.0);
         assert_abs_diff_eq!(nodes.len(), 687959, epsilon = 50);
+    }
+
+    #[test]
+    fn nearby_cache_reuses_a_padded_query_until_meaningful_movement() {
+        let mut graph = Graph::new(1);
+        ensure_nearby(&mut graph, &Position::origin(), 2.0);
+        let mut cache = NearbyCache::default();
+        cache.refresh(&graph, &Position::origin(), 1.0, 0.25);
+        let cached_len = cache.nodes().len();
+
+        let nearby = Position {
+            node: NodeId::ROOT,
+            local: MIsometry::translation_along(&na::Vector3::new(0.1, 0.0, 0.0)),
+        };
+        assert!(!cache.needs_refresh(&graph, &nearby, 1.0, 0.25));
+        assert_eq!(cache.nodes().len(), cached_len);
+
+        let far = Position {
+            node: NodeId::ROOT,
+            local: MIsometry::translation_along(&na::Vector3::new(0.3, 0.0, 0.0)),
+        };
+        assert!(cache.needs_refresh(&graph, &far, 1.0, 0.25));
+    }
+
+    #[test]
+    fn nearby_cache_rebases_without_retraversing_on_cell_crossing() {
+        let mut graph = Graph::new(1);
+        let neighbor = graph.ensure_neighbor(NodeId::ROOT, Side::A);
+        let mut cache = NearbyCache::default();
+        cache.refresh(&graph, &Position::origin(), 1.0, 0.25);
+        let nodes = cache.shared_nodes();
+
+        assert!(cache.rebase_to(neighbor));
+        assert!(Arc::ptr_eq(&nodes, &cache.shared_nodes()));
+        let cached_neighbor = cache
+            .nodes()
+            .iter()
+            .find(|(node, _)| *node == neighbor)
+            .unwrap()
+            .1;
+        assert_abs_diff_eq!(
+            cache.basis() * cached_neighbor,
+            MIsometry::identity(),
+            epsilon = 1.0e-5
+        );
     }
 }
